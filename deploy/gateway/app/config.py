@@ -72,6 +72,7 @@ class Settings:
     casdoor_app_id: str = ""
     casdoor_app_secret: str = ""
     casdoor_timeout: float = 5.0
+    casdoor_user_cache_ttl: float = 300.0
 
     def source(self, source_id: str) -> Optional[SourceSystem]:
         return self.sources.get(source_id)
@@ -215,4 +216,5 @@ def load_settings() -> Settings:
         casdoor_app_id=_env("CASDOOR_APP_ID", "") or "",
         casdoor_app_secret=_env("CASDOOR_APP_SECRET", "") or "",
         casdoor_timeout=_env_float("CASDOOR_TIMEOUT", 5.0),
+        casdoor_user_cache_ttl=_env_float("CASDOOR_USER_CACHE_TTL", 300.0),
     )

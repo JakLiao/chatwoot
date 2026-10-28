@@ -75,7 +75,7 @@ X-Intake-Key: ci_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 |---|---|---|
 | `source_system` | ✅ | 来源系统 id，必须在网关注册表里登记，且与 API Key 绑定的来源一致 |
 | `request_id` | 推荐 | 上游请求唯一 ID，**幂等键**。同一个 `request_id` 重复提交只会产生一条会话 |
-| `customer.identifier` | ✅ | 客户唯一标识。**建议填 Casdoor 里的用户名**（`yujingsi` 组织下），网关会用它回查 Casdoor。网关会自动加来源前缀再写进 Chatwoot，所以不同系统的同名客户不会互相覆盖 |
+| `customer.identifier` | ✅ | 客户唯一标识。**建议填 Casdoor 里的用户 id（`sub`，UUID）**（`yujingsi` 组织下），网关会用它回查 Casdoor。填用户名也能查，但用户名会变，不适合当身份键。网关会自动加来源前缀再写进 Chatwoot，所以不同系统的同名客户不会互相覆盖 |
 | `customer.name` | | 客户昵称/姓名（**不是**身份凭证，只是展示用）。不传时网关会从 Casdoor 取展示名补上 |
 | `customer.company` / `city` | | 公司/组织、城市 |
 | `customer.extra` | | 其余客户属性，拍平后带进联系人 `additional_attributes`（身份字段会被丢弃） |
@@ -189,7 +189,7 @@ curl -X POST http://127.0.0.1:8080/intake/v1/feedback \
 
 1. 找管理员要一把 Key（每个来源系统一把，`keys/<source_id>.key`）
 2. 确认 `source_system` 与 Key 绑定的来源一致
-3. `customer.identifier` 填 **Casdoor 的用户 id（或用户名）** —— 不要填邮箱/电话
+3. `customer.identifier` 填 **Casdoor 的用户 id（`sub`，UUID）** —— 不要填邮箱/电话，也不要填会变的用户名
 4. 每条反馈生成一个唯一 `request_id`
 5. POST 到内网地址的 `/intake/v1/feedback`
 6. 失败时带**原样的 `request_id`** 重试
@@ -215,5 +215,9 @@ curl -X POST http://127.0.0.1:8080/intake/v1/feedback \
 
 回查只读取**展示名**和**用户 id**。Casdoor 里的邮箱、电话**永远不会被写进 Chatwoot**。
 
-> `identifier` 填 Casdoor 的**用户名**（如 `trial_test_user`）才能查到。填 UUID 或
-> 其它系统的 id 就查不到 —— 那时只是少了展示名补全，反馈照常入库。
+> `identifier` 填 Casdoor 的**用户名**（如 `trial_test_user`）或**用户 id（UUID）**都能查到。
+> 推荐用 **UUID（`sub`）** —— 用户名会变（访客 `guest_<uuid>` → 升级注册后变真实名），
+> 用它当身份键会把同一个人的反馈拆成多个 Chatwoot 联系人。
+> 填其它系统的 id 查不到 —— 那时只是少了展示名补全，反馈照常入库。
+
+完整端到端流程（含显形侧的字段映射与接入清单）见 **[feedback-flow.md](feedback-flow.md)**。

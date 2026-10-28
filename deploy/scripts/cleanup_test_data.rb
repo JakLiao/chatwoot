@@ -15,12 +15,17 @@
 #     rails bundle exec rails runner /bootstrap/scripts/cleanup_test_data.rb
 # ============================================================================
 
-# 清理两类测试数据：
-#   company_xianxing:verify-*   自检脚本提交的
-#   company_xianxing:auto_*     无 request_id 时自动推导幂等键的边界用例
+# 清理几类测试数据：
+#   company_xianxing:verify-*            自检脚本提交的
+#   company_xianxing:auto_*              无 request_id 时自动推导幂等键的边界用例
+#   company_xianxing:casdoor-probe-*     Casdoor 用户名 / UUID 两条路径的探测
+#   company_xianxing:uuid-probe-*        UUID 路径探测（source_id 前缀）
+#   company_xianxing:xianxing-flow-probe-*  显形侧字段映射的端到端验证
 TEST_PREFIXES = ENV.fetch(
   'TEST_SOURCE_ID_PREFIXES',
-  'company_xianxing:verify-,company_xianxing:auto_,company_xianxing:casdoor-probe-'
+  'company_xianxing:verify-,company_xianxing:auto_,' \
+  'company_xianxing:casdoor-probe-,company_xianxing:uuid-probe-,' \
+  'company_xianxing:xianxing-flow-probe-'
 ).split(',').map(&:strip).reject(&:empty?)
 
 account = Account.order(:id).first

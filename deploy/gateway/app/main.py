@@ -41,7 +41,9 @@ log = logging.getLogger("intake")
 # JSONB 字符串长度上限（Chatwoot 属性限制），留一点余量
 _MAX_STR = 1400
 _MAX_INT = 9_999_999_999
-_KEY_SAFE = re.compile(r"[^0-9A-Za-z_.-]+")
+# 标签/属性键的安全字符：Unicode 字母数字 + 下划线 + 点 + 连字符
+# （Python 3 的 \w 已经是 Unicode 感知的 —— 中文属于 \w，不会被误伤）
+_KEY_SAFE = re.compile(r"[^\w.-]+", re.UNICODE)
 
 
 @asynccontextmanager
@@ -56,6 +58,7 @@ async def lifespan(app: FastAPI):
             app_id=settings.casdoor_app_id,
             app_secret=settings.casdoor_app_secret,
             timeout=settings.casdoor_timeout,
+            user_cache_ttl=settings.casdoor_user_cache_ttl,
         )
         if settings.casdoor_configured
         else None
@@ -335,12 +338,19 @@ def _labels_for(source: SourceSystem, payload: IntakeRequest) -> List[str]:
 def _safe_label(raw: str) -> str:
     """把任意类型名洗成合法的 Chatwoot 标签标题。
 
-    Chatwoot 的规则：\\A[\\p{L}\\p{N}]+[\\p{L}\\p{N}_-]+\\z（至少 2 字符，不能有空格）。
+    Chatwoot 的规则：\\A[\\p{L}\\p{N}]+[\\p{L}\\p{N}_-]+\\z
+    （首字符必须是字母/数字，至少 2 个字符，不能有空格）。
+
+    ⚠️ 中文属于 \\p{L} —— Chatwoot **允许**中文标签（来源标签「公司显形」就是这么建的）。
+    所以这里只洗掉空白与标点，**不能把中文一起替换掉**，
+    否则「太慢了」会变成 t_unknown，丢掉所有区分度。
     """
     candidate = _KEY_SAFE.sub("_", (raw or "").strip().lower())
-    candidate = candidate.strip("_")
+    candidate = candidate.strip("_-")
+    if not candidate:
+        return "t_unknown"
     if len(candidate) < 2:
-        candidate = f"t_{candidate}" if candidate else "t_unknown"
+        candidate = f"t_{candidate}"
     return candidate[:50]
 
 
