@@ -63,7 +63,8 @@ Chatwoot 里按来源、类型、情绪做筛选和跟进。
 ├── overrides/
 │   └── zz_sidekiq_redis_timeout.rb  # 覆盖 Sidekiq 的 Redis 读超时（见文件头）
 └── docs/
-    └── intake-api.md             # 接入方看这份
+    ├── intake-api.md             # 接入方看这份（接口契约）
+    └── feedback-flow.md          # 端到端流程（显形侧字段映射 + Casdoor 回查）
 ```
 
 ## 管理后台
@@ -201,5 +202,6 @@ fork 仓库：`https://github.com/JakLiao/chatwoot`（部署在 `deploy/` 子目
 
 ## 关联
 
-- 接入方看：[docs/intake-api.md](docs/intake-api.md)
+- 接入方看：[docs/intake-api.md](docs/intake-api.md)（接口契约）
+- 想知道「第三方 App 提交什么、怎么从 Casdoor 查到人」：[docs/feedback-flow.md](docs/feedback-flow.md)
 - Chatwoot 官方配置文档：https://www.chatwoot.com/docs/self-hosted/configuration/environment-variables/
