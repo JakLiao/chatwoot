@@ -88,21 +88,6 @@ class ChatwootClient:
         contacts = _extract_list(data, ("payload",), ("contacts",), ("data", "payload"))
         return contacts[0] if contacts else None
 
-    async def find_contact_by_email(self, email: str) -> Optional[Dict[str, Any]]:
-        body = {
-            "payload": [
-                {
-                    "attribute_key": "email",
-                    "filter_operator": "equal_to",
-                    "values": [email],
-                    "query_operator": None,
-                }
-            ]
-        }
-        data = await self._request("POST", "/contacts/filter", json=body)
-        contacts = _extract_list(data, ("payload",), ("contacts",), ("data", "payload"))
-        return contacts[0] if contacts else None
-
     async def create_contact(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         data = await self._request("POST", "/contacts", json=payload)
         if isinstance(data, dict):

@@ -33,8 +33,6 @@ X-Intake-Key: ci_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
   "customer": {
     "identifier": "user-10086",
     "name": "张三",
-    "email": "zhangsan@example.com",
-    "phone_number": "+8613800000000",
     "company": "某某公司",
     "city": "杭州",
     "extra": { "vip_level": "gold" }
@@ -57,15 +55,30 @@ X-Intake-Key: ci_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 }
 ```
 
+### 不采集邮箱与电话
+
+**客户身份信息（邮箱、手机号等）统一由 Casdoor 管理，采集接口一律不收，Chatwoot 侧也不落库。**
+
+- `customer` 里**没有** `email` / `phone_number` 字段。
+- 传了会被**明确拒绝**（422，错误信息里会指向 Casdoor），而不是被静默忽略 —— 免得上游
+  以为「提交了就已经收下了」。
+- `customer.extra` 里若藏了 `email` / `phone` / `mobile` 之类的键，会被**丢弃**并打一条
+  告警日志。
+- 需要联系客户、去查用户资料，请去 Casdoor。
+
+> `customer.identifier` 建议填 **Casdoor 里的用户 id（或用户名）**，这样两个系统能对上，
+> 客服在 Chatwoot 里看到反馈时，直接拿 identifier 去 Casdoor 查人即可。
+
 ### 字段说明
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `source_system` | ✅ | 来源系统 id，必须在网关注册表里登记，且与 API Key 绑定的来源一致 |
 | `request_id` | 推荐 | 上游请求唯一 ID，**幂等键**。同一个 `request_id` 重复提交只会产生一条会话 |
-| `customer.identifier` | ✅ | 该客户在**来源系统内部**的唯一标识。网关会自动加来源前缀再写进 Chatwoot，所以不同系统的同名客户不会互相覆盖 |
-| `customer.name` / `email` / `phone_number` / `company` / `city` | | 基本信息。邮箱非法时会被丢弃而不是让整条反馈失败 |
-| `customer.extra` | | 其余客户属性，拍平后带进联系人 `additional_attributes` |
+| `customer.identifier` | ✅ | 客户唯一标识。网关会自动加来源前缀再写进 Chatwoot，所以不同系统的同名客户不会互相覆盖 |
+| `customer.name` | | 客户昵称/姓名（**不是**身份凭证，只是展示用） |
+| `customer.company` / `city` | | 公司/组织、城市 |
+| `customer.extra` | | 其余客户属性，拍平后带进联系人 `additional_attributes`（身份字段会被丢弃） |
 | `feedback.content` | ✅ | 客户原话。会作为一条 `incoming` 消息的正文 |
 | `feedback.title` | | 一句话标题，带进会话 `additional_attributes` |
 | `feedback.feedback_type` | | `complaint` / `suggestion` / `praise` / `question` … 会同时成为会话标签 |
@@ -110,7 +123,7 @@ X-Intake-Key: ci_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 |---|---|---|
 | `401` | API Key 不认识 | 检查 `X-Intake-Key` |
 | `403` | 来源系统已停用 | 联系管理员 |
-| `422` | 载荷不合法 / 来源未登记 / Key 与 `source_system` 不匹配 | 看 `detail` |
+| `422` | 载荷不合法 / 来源未登记 / Key 与 `source_system` 不匹配 / 传了邮箱电话 | 看 `detail` |
 | `502` | 下游 Chatwoot 调用失败 | 重试，带上同样的 `request_id`（不会重复入库） |
 
 ## 幂等规则
@@ -143,9 +156,10 @@ X-Intake-Key: ci_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 | `feedback.content` | 消息正文（`message_type=incoming`） |
 | `feedback.title` / `feedback_type` / `sentiment` / `rating` / `channel` / `occurred_at` | 会话属性 + `additional_attributes.intake_*` |
 | `metadata.*` | 会话 `additional_attributes.meta.*`（嵌套会拍平成 `meta.a.b`） |
-| `customer.*` | 联系人姓名/邮箱/手机号 + `additional_attributes`（公司、城市等） |
+| `customer.name` / `company` / `city` | 联系人姓名 + `additional_attributes`（公司、城市等） |
 | `customer.identifier` | 联系人 `identifier`（实际写入 `<来源系统>:<原始标识>`） |
 | 接收时间 | `additional_attributes.intake_received_at` |
+| **邮箱 / 电话** | **不采集、不落库** —— 身份以 Casdoor 为唯一源 |
 
 会话建在专用的 **API 频道收件箱**（默认名「客户声音采集」）里 —— Chatwoot 只允许
 API 频道收 `incoming` 消息，客户反馈必须走这个频道。
@@ -174,6 +188,17 @@ curl -X POST http://127.0.0.1:8080/intake/v1/feedback \
 
 1. 找管理员要一把 Key（每个来源系统一把，`keys/<source_id>.key`）
 2. 确认 `source_system` 与 Key 绑定的来源一致
-3. 每条反馈生成一个唯一 `request_id`
-4. POST 到内网地址的 `/intake/v1/feedback`
-5. 失败时带**原样的 `request_id`** 重试
+3. `customer.identifier` 填 **Casdoor 的用户 id（或用户名）** —— 不要填邮箱/电话
+4. 每条反馈生成一个唯一 `request_id`
+5. POST 到内网地址的 `/intake/v1/feedback`
+6. 失败时带**原样的 `request_id`** 重试
+
+## 与 Casdoor 的关系
+
+| 职责 | 归属 |
+|---|---|
+| 用户身份（邮箱、电话、账号） | **Casdoor**（`http://casdoor.test:9201`）—— 唯一真值源 |
+| 客户声音内容与来源 | 本系统（Chatwoot） |
+| 上游服务如何拿到当前用户 | 从 Casdoor 会话取，再把 `identifier` 传给采集接口 |
+
+采集接口不碰身份数据；Chatwoot 侧也不冗余存一份。要看用户资料，去 Casdoor。

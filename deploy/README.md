@@ -22,6 +22,8 @@ Chatwoot 里按来源、类型、情绪做筛选和跟进。
   上游服务通过**内网地址**访问网关。
 - **不自带 PG / Redis**：复用本机共享实例，遵循 `~/postgres-trial`、`~/valkey`、
   `~/casdoor` 的「周边组件独立托管、业务项目只接入」范式。
+- **不采集身份信息**：客户邮箱、电话等统一由 **Casdoor** 管理 —— 采集接口不收这些字段，
+  Chatwoot 侧也不落库。上游只需传 `customer.identifier`（建议用 Casdoor 的用户 id/用户名）。
 - **密钥不进 git**：真值在 `.env`（600）与 `keys/`（700 目录 / 600 文件）；
   注册表里只存 API Key 的 sha256 摘要。
 

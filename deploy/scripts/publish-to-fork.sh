@@ -28,6 +28,8 @@ ROOT="$(dirname "$HERE")"
 
 FORK_DIR="${CHATWOOT_FORK_DIR:-$HOME/projects/chatwoot-fork}"
 DEPLOY_SUBDIR="deploy"
+# 默认分支：长期在 feat/voc-intake-deploy 上提交，不误推 develop
+DEFAULT_BRANCH="${CHATWOOT_PUBLISH_BRANCH:-feat/voc-intake-deploy}"
 BRANCH=""
 DRY_RUN=0
 DO_PUSH=1
@@ -143,14 +145,13 @@ fi
 # 4. 提交
 # --------------------------------------------------------------------------
 cd "$FORK_DIR"
-if [ -n "$BRANCH" ]; then
-  if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
-    echo "==> 切到已有分支 $BRANCH"
-    git checkout "$BRANCH"
-  else
-    echo "==> 新建分支 $BRANCH"
-    git checkout -b "$BRANCH"
-  fi
+BRANCH="${BRANCH:-$DEFAULT_BRANCH}"
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  echo "==> 切到已有分支 $BRANCH"
+  git checkout "$BRANCH"
+else
+  echo "==> 新建分支 $BRANCH"
+  git checkout -b "$BRANCH"
 fi
 
 git add -A "$DEPLOY_SUBDIR"
@@ -167,25 +168,26 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
-git commit -q -m "$(cat <<'MSG'
-chore(deploy): 客户声音收集系统部署与采集网关
+# 提交信息：PUBLISH_MESSAGE 优先，否则自动生成带变更清单的
+CHANGED_COUNT="$(git diff --cached --name-only | wc -l | tr -d ' ')"
+CHANGED_LIST="$(git diff --cached --name-status | sed 's/^/  /')"
+if [ -n "${PUBLISH_MESSAGE:-}" ]; then
+  COMMIT_SUBJECT="$PUBLISH_MESSAGE"
+  COMMIT_BODY="${PUBLISH_BODY:-}
 
-在 Chatwoot fork 上落地内网客户声音（VOC）采集体系：
+变更清单：
+${CHANGED_LIST}"
+else
+  COMMIT_SUBJECT="chore(deploy): 同步本地部署（${CHANGED_COUNT} 个文件）"
+  COMMIT_BODY="变更清单：
+${CHANGED_LIST}"
+fi
 
-- deploy/docker-compose.yml  —— rails / sidekiq / intake 三服务，
-  复用本机共享 PostgreSQL 与 Valkey，发布端口只绑 127.0.0.1
-- deploy/gateway/            —— 统一采集网关：来源系统注册表 + 每来源一把
-  API Key + 自动补齐来源系统/请求 ID/时间戳/原始 metadata
-- deploy/scripts/            —— 建库建角色、迁移、引导初始化（账户/管理员/
-  令牌/API 收件箱/标签/自定义属性）、端到端自检、密码重置
-- deploy/overrides/          —— 覆盖 Sidekiq 的 Redis 读超时（Chatwoot 硬编码
-  1 秒，短于阻塞读等待时间，会刷 Error fetching job 噪音日志）
-- deploy/docs/              —— 接入方接口契约与运维说明
+git commit -q -F - <<MSG
+${COMMIT_SUBJECT}
 
-密钥（.env / keys/ / api_key_sha256）一律不提交，由 scripts/gen-env.py
-在目标机生成。
+${COMMIT_BODY}
 MSG
-)"
 
 echo "==> 已提交：$(git log -1 --format='%h %s')"
 

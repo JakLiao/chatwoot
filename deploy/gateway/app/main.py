@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse
 
 from .chatwoot import ChatwootClient, ChatwootError
 from .config import Settings, SourceSystem, load_settings
-from .schemas import IntakeRequest, IntakeResponse, SourceInfo
+from .schemas import IDENTITY_FIELDS, IntakeRequest, IntakeResponse, SourceInfo
 from .security import API_KEY_HEADER, resolve_source
 
 logging.basicConfig(
@@ -325,16 +325,14 @@ async def _create_contact(
     try:
         return await client.create_contact(body)
     except ChatwootError as exc:
-        # 邮箱在账户内唯一 —— 撞车时退回按邮箱找联系人，或去掉邮箱重建
-        if exc.status_code != 422 or not payload.customer.email:
+        # identifier 在账户内唯一 —— 撞车时（并发提交同一客户）回查复用
+        if exc.status_code != 422:
             raise
-        log.warning("联系人创建冲突（identifier=%s），改按邮箱回查", identifier)
-        existing = await client.find_contact_by_email(payload.customer.email)
+        log.warning("联系人创建冲突（identifier=%s），改按 identifier 回查", identifier)
+        existing = await client.find_contact_by_identifier(identifier)
         if existing:
             return existing
-        body.pop("email", None)
-        body.pop("phone_number", None)
-        return await client.create_contact(body)
+        raise
 
 
 async def _refresh_contact(
@@ -348,13 +346,10 @@ async def _refresh_contact(
     updates: Dict[str, Any] = {}
     if payload.customer.name and contact.get("name") != payload.customer.name:
         updates["name"] = payload.customer.name
-    if payload.customer.phone_number and contact.get("phone_number") != payload.customer.phone_number:
-        updates["phone_number"] = payload.customer.phone_number
-    if payload.customer.email and contact.get("email") != payload.customer.email:
-        updates["email"] = payload.customer.email
+    # ⚠️ 不更新邮箱/电话 —— 身份信息由 Casdoor 统一管理，Chatwoot 侧不落库
 
     additional = dict(contact.get("additional_attributes") or {})
-    extra_attrs = _sanitize_dict(payload.customer.extra, prefix="customer.")
+    extra_attrs = _sanitize_dict(payload.customer.extra, prefix="customer.", drop_identity=True)
     additional.update(extra_attrs)
     additional["source_system"] = source.id
     additional["intake_last_request_id"] = request_id
@@ -388,7 +383,7 @@ def _contact_body(
         additional["company_name"] = customer.company
     if customer.city:
         additional["city"] = customer.city
-    additional.update(_sanitize_dict(customer.extra, prefix="customer."))
+    additional.update(_sanitize_dict(customer.extra, prefix="customer.", drop_identity=True))
 
     body: Dict[str, Any] = {
         "inbox_id": app.state.settings.inbox_id,
@@ -398,10 +393,7 @@ def _contact_body(
     }
     if customer.name:
         body["name"] = customer.name
-    if customer.email:
-        body["email"] = customer.email
-    if customer.phone_number:
-        body["phone_number"] = customer.phone_number
+    # ⚠️ 刻意不写 email / phone_number —— 身份信息由 Casdoor 统一管理
     return body
 
 
@@ -471,12 +463,19 @@ def _build_conversation_body(
     }
 
 
-def _sanitize_dict(data: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
-    """把任意嵌套结构拍平成「字符串键 → 标量值」，并做长度/类型收敛。"""
+def _sanitize_dict(data: Dict[str, Any], prefix: str = "", drop_identity: bool = False) -> Dict[str, Any]:
+    """把任意嵌套结构拍平成「字符串键 → 标量值」，并做长度/类型收敛。
+
+    ``drop_identity=True`` 时会把邮箱/电话一类身份字段**丢掉** —— 身份信息归
+    Casdoor 管，采集接口不该把它们带进 Chatwoot。
+    """
     out: Dict[str, Any] = {}
     for raw_key, value in (data or {}).items():
         key = _KEY_SAFE.sub("_", str(raw_key)).strip("_")[:60]
         if not key:
+            continue
+        if drop_identity and key.lower() in IDENTITY_FIELDS:
+            log.warning("丢弃身份字段 %s%s（身份信息由 Casdoor 统一管理）", prefix, raw_key)
             continue
         full_key = f"{prefix}{key}"[:120]
         out.update(_flatten_value(full_key, value))

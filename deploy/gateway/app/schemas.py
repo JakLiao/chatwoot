@@ -8,6 +8,13 @@
 * ``customer.identifier`` 是**来源系统内部**的客户唯一标识 —— 网关会加上
   来源前缀再写进 Chatwoot，避免不同系统的同名客户互相覆盖。
 * ``request_id`` 是推荐的幂等键：同一个 request_id 重复提交只会产生一条会话。
+
+⚠️ **不采集邮箱与电话**
+   客户身份信息（邮箱、手机号等）统一由 Casdoor 管理，采集接口一律不收，
+   Chatwoot 侧也不落库 —— 身份的唯一真值源是 Casdoor，不是这里。
+   需要联系客户时去 Casdoor 查。
+   因此 ``customer`` 里**没有** ``email`` / ``phone_number``；传了会被明确拒绝
+   （而不是被静默忽略），免得上游以为「提交了就已经收下了」。
 """
 
 from __future__ import annotations
@@ -15,11 +22,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# 身份信息字段名 —— 这些在采集接口里一律不接受
+IDENTITY_FIELDS = frozenset(
+    {"email", "phone", "phone_number", "mobile", "tel", "telephone"}
+)
 
 
 class Customer(BaseModel):
-    """客户基本信息。"""
+    """客户基本信息（**不含**邮箱与电话）。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -27,29 +39,28 @@ class Customer(BaseModel):
         ...,
         min_length=1,
         max_length=200,
-        description="来源系统内部的客户唯一标识（如 user_id / 手机号）",
+        description="来源系统内部的客户唯一标识（建议填 Casdoor 的用户 id/用户名）",
     )
     name: Optional[str] = Field(None, max_length=200, description="客户昵称/姓名")
-    email: Optional[str] = Field(None, max_length=200, description="邮箱")
-    phone_number: Optional[str] = Field(None, max_length=60, description="手机号")
     company: Optional[str] = Field(None, max_length=200, description="公司/组织")
     city: Optional[str] = Field(None, max_length=100, description="城市")
     extra: Dict[str, Any] = Field(default_factory=dict, description="其余客户属性，原样带进 additional_attributes")
 
-    @field_validator("email")
+    @model_validator(mode="before")
     @classmethod
-    def _check_email(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        value = value.strip()
-        if not value:
-            return None
-        # 极简校验：真正的合法性交给 Chatwoot，但明显非法的先丢掉，免得整条反馈被拒
-        if "@" not in value or value.startswith("@") or value.endswith("@") or " " in value:
-            return None
-        return value.lower()
+    def _reject_identity_fields(cls, data: Any) -> Any:
+        """邮箱/电话是 Casdoor 管的 —— 传了就明确报错，不静默吞掉。"""
+        if not isinstance(data, dict):
+            return data
+        hit = sorted(IDENTITY_FIELDS & {str(k).lower() for k in data.keys()})
+        if hit:
+            raise ValueError(
+                f"不采集身份信息：{'、'.join(hit)} 由 Casdoor 统一管理，"
+                f"采集接口只接受 customer.identifier（客户在 Casdoor 里的 id/用户名）"
+            )
+        return data
 
-    @field_validator("name", "phone_number", "company", "city")
+    @field_validator("name", "company", "city")
     @classmethod
     def _strip(cls, value: Optional[str]) -> Optional[str]:
         if value is None:

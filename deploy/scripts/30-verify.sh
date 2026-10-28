@@ -11,7 +11,8 @@
 #   6. 同一个 request_id 再提交一次 → 命中幂等（不新建会话、不重复建联系人）
 #   7. Chatwoot 侧能查到这条会话，且来源系统/自定义属性/标签都对
 #   9. 共享 PG 里确实落库
-#   10. 清理本次产生的测试数据
+#   10. 身份信息（邮箱/电话）确认不落库
+#   11. 清理本次产生的测试数据
 # ============================================================================
 
 set -euo pipefail
@@ -34,7 +35,7 @@ ok()    { printf '    \033[32m✔ %s\033[0m\n' "$1"; }
 fail()  { printf '    \033[31m✘ %s\033[0m\n' "$1"; FAILED=1; }
 
 # ---- 1. 容器状态 -------------------------------------------------------
-step "1/10 容器状态"
+step "1/11 容器状态"
 for svc in rails sidekiq intake; do
   state="$(docker compose ps --format '{{.Service}} {{.State}}' "$svc" 2>/dev/null || true)"
   if printf '%s' "$state" | grep -q "running"; then
@@ -45,7 +46,7 @@ for svc in rails sidekiq intake; do
 done
 
 # ---- 2. Chatwoot 健康 ---------------------------------------------------
-step "2/10 Chatwoot 健康"
+step "2/11 Chatwoot 健康"
 if curl -fsS --max-time 10 "$CW_URL/health" >/dev/null 2>&1; then
   ok "$CW_URL/health 可用"
 else
@@ -53,7 +54,7 @@ else
 fi
 
 # ---- 3. 网关健康 --------------------------------------------------------
-step "3/10 采集网关健康"
+step "3/11 采集网关健康"
 if curl -fsS --max-time 10 "$INTAKE_URL/healthz" >/dev/null 2>&1; then
   ok "$INTAKE_URL/healthz 可用"
 else
@@ -61,7 +62,7 @@ else
 fi
 
 # ---- 4. 端口绑定 --------------------------------------------------------
-step "4/10 端口只绑回环"
+step "4/11 端口只绑回环"
 for container in chatwoot-rails chatwoot-intake; do
   # ⚠️ grep 无匹配会返回 1，配合 set -e/pipefail 会直接中断脚本 —— 必须兜住
   host_ips="$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostIp}} {{end}}{{end}}' "$container" 2>/dev/null \
@@ -97,7 +98,7 @@ for port in "${CHATWOOT_PORT:-3000}" "${INTAKE_PORT:-8080}"; do
 done
 
 # ---- 5. 管理员登录 ------------------------------------------------------
-step "5/10 管理员登录"
+step "5/11 管理员登录"
 ADMIN_EMAIL="${CHATWOOT_ADMIN_EMAIL:-voice-admin@chatwoot.local}"
 ADMIN_PW_FILE="$ROOT/keys/admin-password.txt"
 if [ -f "$ADMIN_PW_FILE" ]; then
@@ -117,7 +118,7 @@ else
 fi
 
 # ---- 6. 提交一条反馈 ----------------------------------------------------
-step "6/10 提交反馈"
+step "6/11 提交反馈"
 REQUEST_ID="verify-$(date +%s)-$$"
 PAYLOAD=$(cat <<JSON
 {
@@ -126,8 +127,6 @@ PAYLOAD=$(cat <<JSON
   "customer": {
     "identifier": "verify-user-$$",
     "name": "自检用户",
-    "email": "verify-$$@localhost",
-    "phone_number": "+8613800000000",
     "company": "自检公司"
   },
   "feedback": {
@@ -163,7 +162,7 @@ else
 fi
 
 # ---- 7. 幂等重放 --------------------------------------------------------
-step "7/10 幂等重放（同一个 request_id）"
+step "7/11 幂等重放（同一个 request_id）"
 RESP2="$(curl -fsS --max-time 30 -X POST "$INTAKE_URL/intake/v1/feedback" \
   -H 'Content-Type: application/json' \
   -H "X-Intake-Key: ${API_KEY}" \
@@ -183,7 +182,7 @@ else
 fi
 
 # ---- 8. Chatwoot 侧核对 -------------------------------------------------
-step "8/10 Chatwoot 侧核对"
+step "8/11 Chatwoot 侧核对"
 CONV="$(curl -fsS --max-time 30 -H "api_access_token: ${CHATWOOT_ACCESS_TOKEN}" \
   "$CW_URL/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${CONVERSATION_ID}")" || true
 if printf '%s' "$CONV" | grep -q '"company_xianxing"'; then
@@ -211,7 +210,7 @@ else
 fi
 
 # ---- 9. 共享 PG 落库核对 -----------------------------------------------------
-step "9/10 共享 PG 落库核对"
+step "9/11 共享 PG 落库核对"
 ROW="$(docker exec trial-web-db psql -U trial -d "${POSTGRES_DATABASE}" -tAc \
   "select c.display_id, c.status, m.content from conversations c join messages m on m.conversation_id = c.id where c.id = ${CONVERSATION_ID} limit 1;" 2>/dev/null || true)"
 if [ -n "$ROW" ]; then
@@ -220,8 +219,29 @@ else
   fail "PG 里查不到这条会话"
 fi
 
-# ---- 9. 清理测试数据 ----------------------------------------------------
-step "10/10 清理测试数据"
+# ---- 10. 身份信息不落库 -------------------------------------------------
+step "10/11 身份信息由 Casdoor 管理，不在采集侧收集"
+CONTACT_ROW="$(docker exec trial-web-db psql -U trial -d "${POSTGRES_DATABASE}" -tAc \
+  "select coalesce(email,'') || '|' || coalesce(phone_number,'') from contacts where id = ${CONTACT_ID};" 2>/dev/null || true)"
+if [ "$CONTACT_ROW" = "|" ]; then
+  ok "Chatwoot 联系人 email/phone_number 均为空"
+else
+  fail "Chatwoot 联系人竟然存了身份信息：$CONTACT_ROW"
+fi
+
+# 传了 email/phone 的请求要被明确拒绝，而不是静默吞掉
+REJECT_BODY="$(curl -s --max-time 20 -X POST "$INTAKE_URL/intake/v1/feedback" \
+  -H 'Content-Type: application/json' \
+  -H "X-Intake-Key: ${API_KEY}" \
+  -d '{"source_system":"company_xianxing","customer":{"identifier":"reject-test","email":"a@b.com"},"feedback":{"content":"x"}}')"
+if printf '%s' "$REJECT_BODY" | grep -q 'Casdoor'; then
+  ok "带 email 的请求被明确拒绝并指向 Casdoor"
+else
+  fail "带 email 的请求没被正确拒绝：$REJECT_BODY"
+fi
+
+# ---- 11. 清理测试数据 ----------------------------------------------------
+step "11/11 清理测试数据"
 CLEANUP="$(docker compose run --rm -v "$ROOT:/bootstrap:ro" \
   rails bundle exec rails runner /bootstrap/scripts/cleanup_test_data.rb 2>&1 || true)"
 printf '%s\n' "$CLEANUP" | grep -E '^\[cleanup\]' | sed 's/^/    /'
