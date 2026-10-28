@@ -1,0 +1,29 @@
+# ============================================================================
+# source_systems.yml · 客户声音采集来源系统注册表
+#
+# 网关只认这里登记的来源：不在表里的 source_system 会被直接拒绝（422）。
+#
+# 字段：
+#   id                  来源系统唯一标识（snake_case）
+#   display_name        显示名
+#   label               挂到 Chatwoot 会话上的标签标题
+#                       ⚠️ 必须满足 \A[\p{L}\p{N}]+[\p{L}\p{N}_-]+\z
+#                          （至少 2 字符，不能有空格，不能以 _ 或 - 开头）
+#   enabled             false = 停用该来源（网关回 403）
+#   api_key_sha256      该来源接入 Key 的 sha256 十六进制摘要（**不要写明文**）
+#   description         备注
+#   default_feedback_type   上游没给 feedback_type 时用的默认值
+#   allow_any_source    true = 这把 Key 可以代表任意已登记来源提交（默认 false，
+#                        即「一把 Key 只能代表一个来源」，防止来源被伪造）
+#
+# 新增来源：python3 scripts/gen-env.py --add-source <id>
+# ============================================================================
+
+sources:
+- id: company_xianxing
+  display_name: 公司显形
+  label: 公司显形
+  enabled: true
+  api_key_sha256: ""   # 本机由 scripts/gen-env.py 填入，勿提交真实摘要
+  description: 公司显形侧的客户反馈入口
+  default_feedback_type: app

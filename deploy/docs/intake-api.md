@@ -1,0 +1,179 @@
+# 客户声音采集接口
+
+上游业务系统只跟这一个接口打交道。
+
+- 基地址：`http://<内网地址>:8080`（本机是 `http://127.0.0.1:8080`）
+- 鉴权：请求头 `X-Intake-Key: <该来源系统的 API Key>`
+- 内容类型：`application/json; charset=utf-8`
+
+> 网关只监听回环。上游服务请走内网地址，**不要**把端口暴露到公网。
+
+## 接口一览
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/intake/v1/feedback` | 提交一条客户声音 |
+| `GET` | `/intake/v1/sources` | 列出你有权提交的来源系统 |
+| `GET` | `/healthz` | 健康检查（不需要鉴权） |
+
+## 提交客户声音
+
+### 请求
+
+```http
+POST /intake/v1/feedback
+Content-Type: application/json
+X-Intake-Key: ci_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+```json
+{
+  "source_system": "company_xianxing",
+  "request_id": "fb-20261028-0001",
+  "customer": {
+    "identifier": "user-10086",
+    "name": "张三",
+    "email": "zhangsan@example.com",
+    "phone_number": "+8613800000000",
+    "company": "某某公司",
+    "city": "杭州",
+    "extra": { "vip_level": "gold" }
+  },
+  "feedback": {
+    "content": "导出报表经常卡住，麻烦优化一下。",
+    "title": "导出卡住",
+    "feedback_type": "complaint",
+    "sentiment": "negative",
+    "rating": 2,
+    "channel": "app",
+    "occurred_at": "2026-10-28T10:12:00+08:00",
+    "extra": { "reproduce_steps": "选了 30 天区间就卡" }
+  },
+  "metadata": {
+    "page": "/report/export",
+    "app_version": "3.2.1",
+    "trace": { "id": "abc-123" }
+  }
+}
+```
+
+### 字段说明
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `source_system` | ✅ | 来源系统 id，必须在网关注册表里登记，且与 API Key 绑定的来源一致 |
+| `request_id` | 推荐 | 上游请求唯一 ID，**幂等键**。同一个 `request_id` 重复提交只会产生一条会话 |
+| `customer.identifier` | ✅ | 该客户在**来源系统内部**的唯一标识。网关会自动加来源前缀再写进 Chatwoot，所以不同系统的同名客户不会互相覆盖 |
+| `customer.name` / `email` / `phone_number` / `company` / `city` | | 基本信息。邮箱非法时会被丢弃而不是让整条反馈失败 |
+| `customer.extra` | | 其余客户属性，拍平后带进联系人 `additional_attributes` |
+| `feedback.content` | ✅ | 客户原话。会作为一条 `incoming` 消息的正文 |
+| `feedback.title` | | 一句话标题，带进会话 `additional_attributes` |
+| `feedback.feedback_type` | | `complaint` / `suggestion` / `praise` / `question` … 会同时成为会话标签 |
+| `feedback.sentiment` | | `positive` / `neutral` / `negative` |
+| `feedback.rating` | | 评分（星级或 NPS） |
+| `feedback.channel` | | 客户表达渠道：`app` / `web` / `phone` / `wechat` … |
+| `feedback.occurred_at` | | 反馈发生时间（ISO8601）。不传就用收到时间 |
+| `feedback.extra` | | 其余反馈属性，拍平后带进 `additional_attributes` |
+| `metadata` | | 来源系统自定义元数据，拍平后带进会话 `additional_attributes` 的 `meta.*` 下 |
+
+未列出的字段会被拒绝（`extra="forbid"`），多传字段请放进 `extra` / `metadata`。
+
+### 响应
+
+`201 Created`：
+
+```json
+{
+  "request_id": "fb-20261028-0001",
+  "source_system": "company_xianxing",
+  "status": "created",
+  "conversation_id": 12,
+  "conversation_display_id": 12,
+  "conversation_uuid": "9f1c...",
+  "contact_id": 5,
+  "inbox_id": 1,
+  "source_id": "company_xianxing:fb-20261028-0001",
+  "labels": ["公司显形", "complaint"]
+}
+```
+
+> `conversation_id` 与 `conversation_display_id` 是同一个值 —— Chatwoot Application API
+> 里的会话 id 就是账户内的 `display_id`（路由按 `find_by!(display_id:)` 解析）。
+> 真正全局唯一的是 `conversation_uuid`。
+
+`status` 为 `duplicate` 表示这次是**幂等重放**，复用了已存在的会话（HTTP 状态仍是 201，
+因为第一次提交也是 201；如果想在重放时区分开，看 `status` 字段即可）。
+
+### 错误
+
+| HTTP | 含义 | 处理建议 |
+|---|---|---|
+| `401` | API Key 不认识 | 检查 `X-Intake-Key` |
+| `403` | 来源系统已停用 | 联系管理员 |
+| `422` | 载荷不合法 / 来源未登记 / Key 与 `source_system` 不匹配 | 看 `detail` |
+| `502` | 下游 Chatwoot 调用失败 | 重试，带上同样的 `request_id`（不会重复入库） |
+
+## 幂等规则
+
+`request_id` → 会话的 `source_id`（`company_xianxing:fb-20261028-0001`）。
+
+**幂等是网关保证的，不是 Chatwoot 保证的。** 原因：Chatwoot 收到重复的 `source_id`
+只会复用那个 contact_inbox，**照样会新建一条会话** —— 唯一索引只挡重复 contact_inbox，
+挡不住重复会话。所以网关在创建之前先按 `source_id` 回查：
+
+- 命中 → 直接复用已有会话，响应 `status = "duplicate"`
+- 没命中 → 才创建
+- 同一 `source_id` 的并发请求在网关内串行化，不会各建一条
+
+同一个 `request_id` 重复提交的结果：
+
+- 不会产生第二条会话
+- 响应里 `status` 是 `duplicate`，`conversation_id` 指向原来那条
+- **网络超时后重试请务必带上原样的 `request_id`**
+
+没传 `request_id` 时网关会兜底推导：优先用 `occurred_at`，没有就用 5 分钟时间桶 ——
+能挡住网络重试，但挡不住隔很久的重复提交。**正式接入请务必传 `request_id`。**
+
+## Chatwoot 侧映射
+
+| 网关字段 | Chatwoot 位置 |
+|---|---|
+| `source_system` | 会话标签 + 会话属性 `source_system` + 联系人属性 `source_system` + 联系人 `additional_attributes.source_system` |
+| `request_id` | 会话属性 `request_id` + `additional_attributes.intake_request_id` |
+| `feedback.content` | 消息正文（`message_type=incoming`） |
+| `feedback.title` / `feedback_type` / `sentiment` / `rating` / `channel` / `occurred_at` | 会话属性 + `additional_attributes.intake_*` |
+| `metadata.*` | 会话 `additional_attributes.meta.*`（嵌套会拍平成 `meta.a.b`） |
+| `customer.*` | 联系人姓名/邮箱/手机号 + `additional_attributes`（公司、城市等） |
+| `customer.identifier` | 联系人 `identifier`（实际写入 `<来源系统>:<原始标识>`） |
+| 接收时间 | `additional_attributes.intake_received_at` |
+
+会话建在专用的 **API 频道收件箱**（默认名「客户声音采集」）里 —— Chatwoot 只允许
+API 频道收 `incoming` 消息，客户反馈必须走这个频道。
+
+## curl 示例
+
+```bash
+curl -X POST http://127.0.0.1:8080/intake/v1/feedback \
+  -H 'Content-Type: application/json' \
+  -H "X-Intake-Key: $(cat keys/company_xianxing.key)" \
+  -d '{
+    "source_system": "company_xianxing",
+    "request_id": "fb-20261028-0001",
+    "customer": { "identifier": "user-10086", "name": "张三" },
+    "feedback": {
+      "content": "导出报表经常卡住，麻烦优化一下。",
+      "feedback_type": "complaint",
+      "sentiment": "negative",
+      "occurred_at": "2026-10-28T10:12:00+08:00"
+    },
+    "metadata": { "page": "/report/export", "app_version": "3.2.1" }
+  }'
+```
+
+## 上游接入清单
+
+1. 找管理员要一把 Key（每个来源系统一把，`keys/<source_id>.key`）
+2. 确认 `source_system` 与 Key 绑定的来源一致
+3. 每条反馈生成一个唯一 `request_id`
+4. POST 到内网地址的 `/intake/v1/feedback`
+5. 失败时带**原样的 `request_id`** 重试
