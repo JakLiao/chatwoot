@@ -135,6 +135,23 @@ docker compose restart intake
 
 来源系统被停用时把注册表里的 `enabled` 改成 `false` 再重启网关即可，网关会回 403。
 
+## 发布到 GitHub fork
+
+本地 `~/projects/chatwoot` 是**唯一真值源**。`scripts/publish-to-fork.sh` 把它同步进
+fork 的 `deploy/` 子目录，剥离密钥后提交推送：
+
+```bash
+bash scripts/publish-to-fork.sh --dry-run                 # 只同步 + 审计，不提交不推送
+bash scripts/publish-to-fork.sh --branch feat/xxx         # 切/建分支后推送
+bash scripts/publish-to-fork.sh --no-push                 # 只提交不推送
+```
+
+脚本会剥离 `.env`、`keys/`、注册表里的 `api_key_sha256`，并在提交前做**密钥审计**：
+拿本机真值里的每个敏感串到待提交内容里全文搜，命中即中止提交。
+
+fork 仓库：`https://github.com/JakLiao/chatwoot`（部署在 `deploy/` 子目录，上游 Chatwoot
+源码原样保留；镜像仍用官方 `chatwoot/chatwoot:v4.19.1`）。
+
 ## 资源约束
 
 宿主 14Gi 内存只剩约 2.5Gi 可用、swap 已用满。所以：
