@@ -65,12 +65,30 @@ class Settings:
     request_timeout: float
     max_content_length: int
     sources: Dict[str, SourceSystem]
+    # Casdoor —— 用户身份的唯一真值源（只读查询；查不到也不阻断采集）
+    casdoor_enabled: bool = False
+    casdoor_base_url: str = ""
+    casdoor_org: str = ""
+    casdoor_app_id: str = ""
+    casdoor_app_secret: str = ""
+    casdoor_timeout: float = 5.0
 
     def source(self, source_id: str) -> Optional[SourceSystem]:
         return self.sources.get(source_id)
 
     def enabled_sources(self) -> List[SourceSystem]:
         return [s for s in self.sources.values() if s.enabled]
+
+    @property
+    def casdoor_configured(self) -> bool:
+        """Casdoor 是否可用（开了开关且四个参数齐了）。"""
+        return bool(
+            self.casdoor_enabled
+            and self.casdoor_base_url
+            and self.casdoor_org
+            and self.casdoor_app_id
+            and self.casdoor_app_secret
+        )
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -191,4 +209,10 @@ def load_settings() -> Settings:
         request_timeout=_env_float("INTAKE_HTTP_TIMEOUT", 20.0),
         max_content_length=_env_int("INTAKE_MAX_CONTENT_LENGTH", 20000),
         sources=load_registry(registry_path),
+        casdoor_enabled=bool(_env("CASDOOR_ENABLED", "false").lower() in ("1", "true", "yes")),
+        casdoor_base_url=(_env("CASDOOR_BASE_URL", "") or "").rstrip("/"),
+        casdoor_org=_env("CASDOOR_ORG", "") or "",
+        casdoor_app_id=_env("CASDOOR_APP_ID", "") or "",
+        casdoor_app_secret=_env("CASDOOR_APP_SECRET", "") or "",
+        casdoor_timeout=_env_float("CASDOOR_TIMEOUT", 5.0),
     )

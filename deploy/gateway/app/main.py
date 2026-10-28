@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from .casdoor import CasdoorClient, display_name_of, user_id_of
 from .chatwoot import ChatwootClient, ChatwootError
 from .config import Settings, SourceSystem, load_settings
 from .schemas import IDENTITY_FIELDS, IntakeRequest, IntakeResponse, SourceInfo
@@ -48,17 +49,32 @@ async def lifespan(app: FastAPI):
     settings = load_settings()
     app.state.settings = settings
     app.state.chatwoot = ChatwootClient(settings)
+    app.state.casdoor = (
+        CasdoorClient(
+            base_url=settings.casdoor_base_url,
+            org=settings.casdoor_org,
+            app_id=settings.casdoor_app_id,
+            app_secret=settings.casdoor_app_secret,
+            timeout=settings.casdoor_timeout,
+        )
+        if settings.casdoor_configured
+        else None
+    )
     log.info(
-        "采集网关就绪：Chatwoot=%s account=%s inbox=%s，已登记来源：%s",
+        "采集网关就绪：Chatwoot=%s account=%s inbox=%s，Casdoor=%s（组织 %s），已登记来源：%s",
         settings.base_url,
         settings.account_id,
         settings.inbox_id,
+        settings.casdoor_base_url if app.state.casdoor else "未启用",
+        settings.casdoor_org or "-",
         ", ".join(sorted(settings.sources)) or "（无）",
     )
     try:
         yield
     finally:
         await app.state.chatwoot.aclose()
+        if app.state.casdoor:
+            await app.state.casdoor.aclose()
 
 
 app = FastAPI(
@@ -87,6 +103,11 @@ async def healthz() -> Dict[str, Any]:
         "account_id": settings.account_id,
         "inbox_id": settings.inbox_id,
         "sources": [s.id for s in settings.enabled_sources()],
+        "casdoor": {
+            "enabled": settings.casdoor_configured,
+            "base_url": settings.casdoor_base_url or None,
+            "org": settings.casdoor_org or None,
+        },
     }
 
 
@@ -123,12 +144,21 @@ async def intake_feedback(
 
     # ---- 1. 联系人：按 identifier upsert ------------------------------
     contact_identifier = _contact_identifier(source.id, payload.customer.identifier)
+
+    # ---- 0. Casdoor 查人：补全展示名 + 记录 Casdoor 用户 id -------------
+    # 身份信息（邮箱/电话）只在 Casdoor 存一份，这里只取展示名，不落任何身份字段。
+    casdoor_user = await _resolve_casdoor_user(payload.customer.identifier)
+
     contact = await client.find_contact_by_identifier(contact_identifier)
     contact_reused = contact is not None
     if contact is None:
-        contact = await _create_contact(client, source, payload, contact_identifier, request_id)
+        contact = await _create_contact(
+            client, source, payload, contact_identifier, request_id, casdoor_user
+        )
     else:
-        contact = await _refresh_contact(client, contact, source, payload, request_id)
+        contact = await _refresh_contact(
+            client, contact, source, payload, request_id, casdoor_user
+        )
 
     # ---- 2. 会话：source_id 幂等 ---------------------------------------
     source_id = _conversation_source_id(source, request_id)
@@ -314,14 +344,35 @@ def _safe_label(raw: str) -> str:
     return candidate[:50]
 
 
+async def _resolve_casdoor_user(identifier: str) -> Optional[Dict[str, Any]]:
+    """拿客户标识去 Casdoor 查人。
+
+    查不到 / Casdoor 不可用都返回 None —— **不阻断采集**。
+    """
+    casdoor: Optional[CasdoorClient] = app.state.casdoor
+    if casdoor is None:
+        return None
+    return await casdoor.get_user(identifier)
+
+
+def _resolved_name(payload: IntakeRequest, casdoor_user: Optional[Dict[str, Any]]) -> Optional[str]:
+    """客户展示名：上游给了就用上游的，没给就用 Casdoor 的。"""
+    if payload.customer.name:
+        return payload.customer.name
+    if casdoor_user:
+        return display_name_of(casdoor_user)
+    return None
+
+
 async def _create_contact(
     client: ChatwootClient,
     source: SourceSystem,
     payload: IntakeRequest,
     identifier: str,
     request_id: str,
+    casdoor_user: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    body = _contact_body(source, payload, identifier, request_id)
+    body = _contact_body(source, payload, identifier, request_id, casdoor_user)
     try:
         return await client.create_contact(body)
     except ChatwootError as exc:
@@ -341,11 +392,13 @@ async def _refresh_contact(
     source: SourceSystem,
     payload: IntakeRequest,
     request_id: str,
+    casdoor_user: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """补齐已存在联系人的信息（名字/邮箱/手机号可能被上游补充过）。"""
+    """补齐已存在联系人的信息（名字可能被上游或 Casdoor 补充过）。"""
     updates: Dict[str, Any] = {}
-    if payload.customer.name and contact.get("name") != payload.customer.name:
-        updates["name"] = payload.customer.name
+    name = _resolved_name(payload, casdoor_user)
+    if name and contact.get("name") != name:
+        updates["name"] = name
     # ⚠️ 不更新邮箱/电话 —— 身份信息由 Casdoor 统一管理，Chatwoot 侧不落库
 
     additional = dict(contact.get("additional_attributes") or {})
@@ -354,6 +407,11 @@ async def _refresh_contact(
     additional["source_system"] = source.id
     additional["intake_last_request_id"] = request_id
     additional["intake_last_seen_at"] = _now_iso()
+    if casdoor_user:
+        casdoor_id = user_id_of(casdoor_user)
+        if casdoor_id:
+            additional["casdoor_user_id"] = casdoor_id
+            additional["casdoor_org"] = app.state.settings.casdoor_org
     if additional != (contact.get("additional_attributes") or {}):
         updates["additional_attributes"] = additional
 
@@ -372,6 +430,7 @@ def _contact_body(
     payload: IntakeRequest,
     identifier: str,
     request_id: str,
+    casdoor_user: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     customer = payload.customer
     additional: Dict[str, Any] = {
@@ -383,6 +442,11 @@ def _contact_body(
         additional["company_name"] = customer.company
     if customer.city:
         additional["city"] = customer.city
+    if casdoor_user:
+        casdoor_id = user_id_of(casdoor_user)
+        if casdoor_id:
+            additional["casdoor_user_id"] = casdoor_id
+            additional["casdoor_org"] = app.state.settings.casdoor_org
     additional.update(_sanitize_dict(customer.extra, prefix="customer.", drop_identity=True))
 
     body: Dict[str, Any] = {
@@ -391,8 +455,9 @@ def _contact_body(
         "additional_attributes": additional,
         "custom_attributes": {"source_system": source.id},
     }
-    if customer.name:
-        body["name"] = customer.name
+    name = _resolved_name(payload, casdoor_user)
+    if name:
+        body["name"] = name
     # ⚠️ 刻意不写 email / phone_number —— 身份信息由 Casdoor 统一管理
     return body
 

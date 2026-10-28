@@ -20,7 +20,7 @@
 #   company_xianxing:auto_*     无 request_id 时自动推导幂等键的边界用例
 TEST_PREFIXES = ENV.fetch(
   'TEST_SOURCE_ID_PREFIXES',
-  'company_xianxing:verify-,company_xianxing:auto_'
+  'company_xianxing:verify-,company_xianxing:auto_,company_xianxing:casdoor-probe-'
 ).split(',').map(&:strip).reject(&:empty?)
 
 account = Account.order(:id).first

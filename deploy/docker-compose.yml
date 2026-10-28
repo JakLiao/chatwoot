@@ -164,6 +164,8 @@ services:
 
     networks:
       chatwoot-net: {}
+      # Casdoor · external —— 用户身份的唯一真值源，走 casdoor.test:9201 查人
+      casdoor-net: {}
 
     mem_limit: 320m
 
@@ -192,6 +194,10 @@ networks:
   # 共享 Valkey（~/valkey）· external —— 必须先存在
   valkey-net:
     name: valkey-net
+    external: true
+  # Casdoor（~/casdoor）· external —— 用户身份的唯一真值源
+  casdoor-net:
+    name: casdoor-net
     external: true
 
 volumes:

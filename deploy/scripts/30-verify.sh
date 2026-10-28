@@ -35,7 +35,7 @@ ok()    { printf '    \033[32m✔ %s\033[0m\n' "$1"; }
 fail()  { printf '    \033[31m✘ %s\033[0m\n' "$1"; FAILED=1; }
 
 # ---- 1. 容器状态 -------------------------------------------------------
-step "1/11 容器状态"
+step "1/12 容器状态"
 for svc in rails sidekiq intake; do
   state="$(docker compose ps --format '{{.Service}} {{.State}}' "$svc" 2>/dev/null || true)"
   if printf '%s' "$state" | grep -q "running"; then
@@ -46,7 +46,7 @@ for svc in rails sidekiq intake; do
 done
 
 # ---- 2. Chatwoot 健康 ---------------------------------------------------
-step "2/11 Chatwoot 健康"
+step "2/12 Chatwoot 健康"
 if curl -fsS --max-time 10 "$CW_URL/health" >/dev/null 2>&1; then
   ok "$CW_URL/health 可用"
 else
@@ -54,7 +54,7 @@ else
 fi
 
 # ---- 3. 网关健康 --------------------------------------------------------
-step "3/11 采集网关健康"
+step "3/12 采集网关健康"
 if curl -fsS --max-time 10 "$INTAKE_URL/healthz" >/dev/null 2>&1; then
   ok "$INTAKE_URL/healthz 可用"
 else
@@ -62,7 +62,7 @@ else
 fi
 
 # ---- 4. 端口绑定 --------------------------------------------------------
-step "4/11 端口只绑回环"
+step "4/12 端口只绑回环"
 for container in chatwoot-rails chatwoot-intake; do
   # ⚠️ grep 无匹配会返回 1，配合 set -e/pipefail 会直接中断脚本 —— 必须兜住
   host_ips="$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostIp}} {{end}}{{end}}' "$container" 2>/dev/null \
@@ -98,7 +98,7 @@ for port in "${CHATWOOT_PORT:-3000}" "${INTAKE_PORT:-8080}"; do
 done
 
 # ---- 5. 管理员登录 ------------------------------------------------------
-step "5/11 管理员登录"
+step "5/12 管理员登录"
 ADMIN_EMAIL="${CHATWOOT_ADMIN_EMAIL:-voice-admin@chatwoot.local}"
 ADMIN_PW_FILE="$ROOT/keys/admin-password.txt"
 if [ -f "$ADMIN_PW_FILE" ]; then
@@ -118,7 +118,7 @@ else
 fi
 
 # ---- 6. 提交一条反馈 ----------------------------------------------------
-step "6/11 提交反馈"
+step "6/12 提交反馈"
 REQUEST_ID="verify-$(date +%s)-$$"
 PAYLOAD=$(cat <<JSON
 {
@@ -162,7 +162,7 @@ else
 fi
 
 # ---- 7. 幂等重放 --------------------------------------------------------
-step "7/11 幂等重放（同一个 request_id）"
+step "7/12 幂等重放（同一个 request_id）"
 RESP2="$(curl -fsS --max-time 30 -X POST "$INTAKE_URL/intake/v1/feedback" \
   -H 'Content-Type: application/json' \
   -H "X-Intake-Key: ${API_KEY}" \
@@ -182,7 +182,7 @@ else
 fi
 
 # ---- 8. Chatwoot 侧核对 -------------------------------------------------
-step "8/11 Chatwoot 侧核对"
+step "8/12 Chatwoot 侧核对"
 CONV="$(curl -fsS --max-time 30 -H "api_access_token: ${CHATWOOT_ACCESS_TOKEN}" \
   "$CW_URL/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${CONVERSATION_ID}")" || true
 if printf '%s' "$CONV" | grep -q '"company_xianxing"'; then
@@ -210,7 +210,7 @@ else
 fi
 
 # ---- 9. 共享 PG 落库核对 -----------------------------------------------------
-step "9/11 共享 PG 落库核对"
+step "9/12 共享 PG 落库核对"
 ROW="$(docker exec trial-web-db psql -U trial -d "${POSTGRES_DATABASE}" -tAc \
   "select c.display_id, c.status, m.content from conversations c join messages m on m.conversation_id = c.id where c.id = ${CONVERSATION_ID} limit 1;" 2>/dev/null || true)"
 if [ -n "$ROW" ]; then
@@ -220,7 +220,7 @@ else
 fi
 
 # ---- 10. 身份信息不落库 -------------------------------------------------
-step "10/11 身份信息由 Casdoor 管理，不在采集侧收集"
+step "10/12 身份信息由 Casdoor 管理，不在采集侧收集"
 CONTACT_ROW="$(docker exec trial-web-db psql -U trial -d "${POSTGRES_DATABASE}" -tAc \
   "select coalesce(email,'') || '|' || coalesce(phone_number,'') from contacts where id = ${CONTACT_ID};" 2>/dev/null || true)"
 if [ "$CONTACT_ROW" = "|" ]; then
@@ -240,8 +240,42 @@ else
   fail "带 email 的请求没被正确拒绝：$REJECT_BODY"
 fi
 
-# ---- 11. 清理测试数据 ----------------------------------------------------
-step "11/11 清理测试数据"
+# ---- 11. Casdoor 用户回查 ------------------------------------------------
+step "11/12 Casdoor 用户回查（补全展示名）"
+CASDOOR_USER="trial_test_user"
+if [ -n "${CASDOOR_APP_ID:-}" ] && [ -n "${CASDOOR_APP_SECRET:-}" ]; then
+  # 直接问 Casdoor 要期望的展示名 —— 不写死，免得对方改了显示名测试就假失败
+  CAS_EXPECTED="$(curl -s --max-time 10 -u "${CASDOOR_APP_ID}:${CASDOOR_APP_SECRET}" \
+    "${CASDOOR_BASE_URL}/api/get-user?id=${CASDOOR_ORG}/${CASDOOR_USER}" 2>/dev/null \
+    | python3 -c "import json,sys
+try:
+    d = json.load(sys.stdin)
+    print((d.get('data') or {}).get('displayName') or '')
+except Exception:
+    print('')" 2>/dev/null || true)"
+  if [ -z "$CAS_EXPECTED" ]; then
+    printf '    \033[33m— Casdoor 不可达或用户不存在，跳过本项\033[0m\n'
+  else
+    CAS_RID="verify-casdoor-$$"
+    CAS_RESP="$(curl -s --max-time 30 -X POST "$INTAKE_URL/intake/v1/feedback" \
+      -H 'Content-Type: application/json' \
+      -H "X-Intake-Key: ${API_KEY}" \
+      -d "{\"source_system\":\"company_xianxing\",\"request_id\":\"${CAS_RID}\",\"customer\":{\"identifier\":\"${CASDOOR_USER}\"},\"feedback\":{\"content\":\"Casdoor 回查自检\"}}")"
+    CAS_CID="$(printf '%s' "$CAS_RESP" | sed -n 's/.*"contact_id":\([0-9]*\).*/\1/p')"
+    CAS_NAME="$(docker exec trial-web-db psql -U trial -d "${POSTGRES_DATABASE}" -tAc \
+      "select name from contacts where id=${CAS_CID};" 2>/dev/null || true)"
+    if [ "$CAS_NAME" = "$CAS_EXPECTED" ]; then
+      ok "Casdoor 回查生效：展示名自动补全为「${CAS_NAME}」"
+    else
+      fail "Casdoor 回查没生效（拿到「${CAS_NAME}」，期望「${CAS_EXPECTED}」）"
+    fi
+  fi
+else
+  printf '    \033[33m— 未配置 Casdoor 凭据，跳过本项\033[0m\n'
+fi
+
+# ---- 12. 清理测试数据 ----------------------------------------------------
+step "12/12 清理测试数据"
 CLEANUP="$(docker compose run --rm -v "$ROOT:/bootstrap:ro" \
   rails bundle exec rails runner /bootstrap/scripts/cleanup_test_data.rb 2>&1 || true)"
 printf '%s\n' "$CLEANUP" | grep -E '^\[cleanup\]' | sed 's/^/    /'

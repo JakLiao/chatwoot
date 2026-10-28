@@ -11,9 +11,12 @@ Chatwoot 里按来源、类型、情绪做筛选和跟进。
 官网/APP  ─┼─HTTP(内网)─▶  intake 网关 :8080 ─┐
 其它服务  ─┘               (来源系统注册表)     ├─▶  rails    :3000 ─┐
                                                 │                  ├─▶ PostgreSQL
-                                                └─▶ sidekiq ───────┘   (~/postgres-trial)
-                                                   (异步任务)         └─▶ Valkey
-                                                                       (~/valkey)
+                                                │                  │   (~/postgres-trial)
+                                                ├─▶ sidekiq ───────┘
+                                                │                    └─▶ Valkey
+                                                │                       (~/valkey)
+                                                └─▶ Casdoor（只读查用户）
+                                                    (~/casdoor · yujingsi 组织)
 ```
 
 ## 边界
@@ -23,7 +26,9 @@ Chatwoot 里按来源、类型、情绪做筛选和跟进。
 - **不自带 PG / Redis**：复用本机共享实例，遵循 `~/postgres-trial`、`~/valkey`、
   `~/casdoor` 的「周边组件独立托管、业务项目只接入」范式。
 - **不采集身份信息**：客户邮箱、电话等统一由 **Casdoor** 管理 —— 采集接口不收这些字段，
-  Chatwoot 侧也不落库。上游只需传 `customer.identifier`（建议用 Casdoor 的用户 id/用户名）。
+  Chatwoot 侧也不落库。上游只需传 `customer.identifier`（建议用 Casdoor 的用户名）。
+  网关会用它回查 Casdoor 补全展示名，并把 `casdoor_user_id` 记进联系人属性便于溯源；
+  **查不到或 Casdoor 不可用都不会阻断采集**。
 - **密钥不进 git**：真值在 `.env`（600）与 `keys/`（700 目录 / 600 文件）；
   注册表里只存 API Key 的 sha256 摘要。
 
@@ -180,7 +185,19 @@ fork 仓库：`https://github.com/JakLiao/chatwoot`（部署在 `deploy/` 子目
 |---|---|---|
 | PostgreSQL 16 + pgvector | `~/postgres-trial`（容器 `trial-web-db`） | 库 `chatwoot` + 角色 `chatwoot`，网络 `postgres-trial-net`，主机名 `db`，容器内端口恒为 5432 |
 | Valkey 7.2 | `~/valkey`（容器 `valkey`） | ACL 用户 `app`，**db1**（db0 已被 trial-web 占用），网络 `valkey-net`，主机名 `valkey` |
+| Casdoor | `~/casdoor`（容器 `casdoor`） | 组织 `yujingsi`，网络 `casdoor-net`，主机名 `casdoor.test:9201`，**只读**查用户 |
 | Chatwoot | 本项目 | 库 `chatwoot`，API 收件箱 id=1，账户 id=1 |
+
+### Casdoor 凭据
+
+网关用 Casdoor 的**应用凭据**（clientId / clientSecret）只读查用户。当前复用
+`~/casdoor/init_data.json` 里 `deepprep-trial-test` 应用的凭据 —— 它本来就在
+`yujingsi` 组织下，能读到该组织的用户。
+
+⚠️ 这意味着采集网关和 trial-web 共用同一个应用密钥：将来若要独立轮换，在 Casdoor 里
+新建一个同组织的应用，然后把 `CASDOOR_APP_ID` / `CASDOOR_APP_SECRET` 改成新值即可，
+代码不用动。凭据由 `scripts/gen-env.py` 从 `~/casdoor/init_data.json` 读取后写入
+`.env`（不进 git）。
 
 ## 关联
 

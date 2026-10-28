@@ -75,8 +75,8 @@ X-Intake-Key: ci_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 |---|---|---|
 | `source_system` | ✅ | 来源系统 id，必须在网关注册表里登记，且与 API Key 绑定的来源一致 |
 | `request_id` | 推荐 | 上游请求唯一 ID，**幂等键**。同一个 `request_id` 重复提交只会产生一条会话 |
-| `customer.identifier` | ✅ | 客户唯一标识。网关会自动加来源前缀再写进 Chatwoot，所以不同系统的同名客户不会互相覆盖 |
-| `customer.name` | | 客户昵称/姓名（**不是**身份凭证，只是展示用） |
+| `customer.identifier` | ✅ | 客户唯一标识。**建议填 Casdoor 里的用户名**（`yujingsi` 组织下），网关会用它回查 Casdoor。网关会自动加来源前缀再写进 Chatwoot，所以不同系统的同名客户不会互相覆盖 |
+| `customer.name` | | 客户昵称/姓名（**不是**身份凭证，只是展示用）。不传时网关会从 Casdoor 取展示名补上 |
 | `customer.company` / `city` | | 公司/组织、城市 |
 | `customer.extra` | | 其余客户属性，拍平后带进联系人 `additional_attributes`（身份字段会被丢弃） |
 | `feedback.content` | ✅ | 客户原话。会作为一条 `incoming` 消息的正文 |
@@ -156,8 +156,9 @@ X-Intake-Key: ci_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 | `feedback.content` | 消息正文（`message_type=incoming`） |
 | `feedback.title` / `feedback_type` / `sentiment` / `rating` / `channel` / `occurred_at` | 会话属性 + `additional_attributes.intake_*` |
 | `metadata.*` | 会话 `additional_attributes.meta.*`（嵌套会拍平成 `meta.a.b`） |
-| `customer.name` / `company` / `city` | 联系人姓名 + `additional_attributes`（公司、城市等） |
+| `customer.name` / `company` / `city` | 联系人姓名 + `additional_attributes`（公司、城市等）。`name` 缺失时用 Casdoor 的展示名 |
 | `customer.identifier` | 联系人 `identifier`（实际写入 `<来源系统>:<原始标识>`） |
+| Casdoor 查到的用户 | 联系人 `additional_attributes.casdoor_user_id` / `casdoor_org`（仅溯源用） |
 | 接收时间 | `additional_attributes.intake_received_at` |
 | **邮箱 / 电话** | **不采集、不落库** —— 身份以 Casdoor 为唯一源 |
 
@@ -197,8 +198,22 @@ curl -X POST http://127.0.0.1:8080/intake/v1/feedback \
 
 | 职责 | 归属 |
 |---|---|
-| 用户身份（邮箱、电话、账号） | **Casdoor**（`http://casdoor.test:9201`）—— 唯一真值源 |
+| 用户身份（邮箱、电话、账号） | **Casdoor**（`http://casdoor.test:9201`，组织 `yujingsi`）—— 唯一真值源 |
 | 客户声音内容与来源 | 本系统（Chatwoot） |
 | 上游服务如何拿到当前用户 | 从 Casdoor 会话取，再把 `identifier` 传给采集接口 |
 
 采集接口不碰身份数据；Chatwoot 侧也不冗余存一份。要看用户资料，去 Casdoor。
+
+### 网关会拿 identifier 回查一次 Casdoor
+
+每次提交，网关会用 `customer.identifier` 去 Casdoor 的 `yujingsi` 组织里查这个用户：
+
+- **查到** → 用 Casdoor 的展示名补 `customer.name`（上游自己传了名就以上游为准），
+  并把 `casdoor_user_id` 记进联系人的 `additional_attributes` 便于溯源。
+- **查不到 / Casdoor 不可用** → 照常入库，只记一条日志。**客户声音不会因为查不到
+  用户而被丢掉。**
+
+回查只读取**展示名**和**用户 id**。Casdoor 里的邮箱、电话**永远不会被写进 Chatwoot**。
+
+> `identifier` 填 Casdoor 的**用户名**（如 `trial_test_user`）才能查到。填 UUID 或
+> 其它系统的 id 就查不到 —— 那时只是少了展示名补全，反馈照常入库。

@@ -21,6 +21,7 @@
 
 import argparse
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -38,6 +39,12 @@ REGISTRY_PATH = ROOT / "gateway" / "config" / "source_systems.yml"
 
 # 本机共享实例（只读引用其真值，不复制口令）
 VALKEY_ENV = pathlib.Path.home() / "valkey" / ".env"
+CASDOOR_INIT = pathlib.Path.home() / "casdoor" / "init_data.json"
+
+# Casdoor：贵司的组织名与采集用的应用（应用凭据只能读本组织下的用户）
+CASDOOR_ORG = os.environ.get("CASDOOR_ORG", "yujingsi")
+CASDOOR_APP = os.environ.get("CASDOOR_APP_NAME", "deepprep-trial-test")
+CASDOOR_BASE_URL = os.environ.get("CASDOOR_BASE_URL", "http://casdoor.test:9201")
 
 # 首批预置的来源系统
 DEFAULT_SOURCE = {
@@ -130,6 +137,16 @@ REDIS_PASSWORD=replace_with_valkey_app_password
 REDIS_ALFRED_SIZE=5
 REDIS_VELMA_SIZE=5
 
+# ---- Casdoor · 用户身份的唯一真值源（只读查询）----
+# 采集接口不收邮箱/电话；网关用 customer.identifier 去 Casdoor 查用户，只补展示名。
+# 凭据取自 ~/casdoor/init_data.json 里对应应用的 clientId/clientSecret。
+CASDOOR_ENABLED=true
+CASDOOR_BASE_URL=http://casdoor.test:9201
+CASDOOR_ORG=yujingsi
+CASDOOR_APP_ID=replace_with_casdoor_client_id
+CASDOOR_APP_SECRET=replace_with_casdoor_client_secret
+CASDOOR_TIMEOUT=5
+
 # ---- 采集网关 ----
 INTAKE_PORT=8080
 CHATWOOT_BASE_URL=http://rails:3000
@@ -156,10 +173,26 @@ def read_valkey_app_password() -> str:
 def rand_hex(n_bytes: int) -> str:
     return secrets.token_hex(n_bytes)
 
-
 def rand_alnum(n: int) -> str:
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def read_casdoor_app(org: str, app_name: str) -> tuple[str, str]:
+    """从 ~/casdoor/init_data.json 里取应用的 clientId / clientSecret。
+
+    只读引用属主项目的真值，不在这里硬编码。
+    """
+    if not CASDOOR_INIT.exists():
+        return "", ""
+    try:
+        data = json.loads(CASDOOR_INIT.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "", ""
+    for app in data.get("applications", []):
+        if app.get("name") == app_name and app.get("organization") == org:
+            return str(app.get("clientId") or ""), str(app.get("clientSecret") or "")
+    return "", ""
 
 
 def new_api_key() -> str:
@@ -247,10 +280,49 @@ def write_env_key(source_id: str, api_key: str) -> None:
     os.chmod(ENV_PATH, 0o600)
 
 
+def casdoor_env_values() -> dict:
+    casdoor_id, casdoor_secret = read_casdoor_app(CASDOOR_ORG, CASDOOR_APP)
+    return {
+        "CASDOOR_ENABLED": "true" if (casdoor_id and casdoor_secret) else "false",
+        "CASDOOR_BASE_URL": CASDOOR_BASE_URL,
+        "CASDOOR_ORG": CASDOOR_ORG,
+        "CASDOOR_APP_ID": casdoor_id,
+        "CASDOOR_APP_SECRET": casdoor_secret,
+        "CASDOOR_TIMEOUT": "5",
+    }
+
+
+def sync_casdoor_env() -> bool:
+    """把 Casdoor 配置同步进**已存在**的 .env —— 只动 Casdoor 段，不碰其它值。
+
+    `--force` 会轮换全部密钥（PG 口令、SECRET_KEY_BASE、访问令牌、各来源 Key），
+    会打断正在运行的部署；只想补 Casdoor 配置时走这条路径。
+    """
+    if not ENV_PATH.exists():
+        return False
+    values = casdoor_env_values()
+    if not values["CASDOOR_APP_ID"]:
+        print("⚠ 没在 ~/casdoor/init_data.json 里找到应用凭据，跳过 Casdoor 同步")
+        return False
+
+    lines = ENV_PATH.read_text().splitlines()
+    for key, value in values.items():
+        for index, line in enumerate(lines):
+            if line.startswith(f"{key}="):
+                lines[index] = f"{key}={value}"
+                break
+        else:
+            lines += ["", "# ---- Casdoor · 用户身份的唯一真值源（只读查询）----", f"{key}={value}"]
+    ENV_PATH.write_text("\n".join(lines) + "\n")
+    os.chmod(ENV_PATH, 0o600)
+    return True
+
+
 # --------------------------------------------------------------------- .env
 def build_env(source_keys: dict) -> str:
     pg_password = rand_hex(24)
     valkey_password = read_valkey_app_password()
+    casdoor_id, casdoor_secret = read_casdoor_app(CASDOOR_ORG, CASDOOR_APP)
 
     lines = [
         "# ==========================================================================",
@@ -319,6 +391,15 @@ def build_env(source_keys: dict) -> str:
         "REDIS_ALFRED_SIZE=5",
         "REDIS_VELMA_SIZE=5",
         "",
+        "# ---- Casdoor · 用户身份的唯一真值源（只读查询）----",
+        "# 采集接口不收邮箱/电话；网关用 customer.identifier 去这里查人，只补展示名。",
+        f"CASDOOR_ENABLED={'true' if casdoor_id and casdoor_secret else 'false'}",
+        f"CASDOOR_BASE_URL={CASDOOR_BASE_URL}",
+        f"CASDOOR_ORG={CASDOOR_ORG}",
+        f"CASDOOR_APP_ID={casdoor_id}",
+        f"CASDOOR_APP_SECRET={casdoor_secret}",
+        "CASDOOR_TIMEOUT=5",
+        "",
         "# ---- 采集网关（intake gateway）----",
         "INTAKE_PORT=8080",
         "# 网关在 compose 内网里走服务名 rails",
@@ -341,6 +422,8 @@ def build_env(source_keys: dict) -> str:
 def cmd_generate(force: bool) -> None:
     if ENV_PATH.exists() and not force:
         print(f"{ENV_PATH} 已存在，跳过（要重建请加 --force）")
+        if sync_casdoor_env():
+            print("已同步 Casdoor 配置进 .env（其余值未动）")
     else:
         KEYS_DIR.mkdir(exist_ok=True)
         os.chmod(KEYS_DIR, 0o700)
