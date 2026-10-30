@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -187,9 +187,58 @@ def load_registry(path: Path) -> Dict[str, SourceSystem]:
     return sources
 
 
+def apply_local_digests(
+    sources: Dict[str, SourceSystem], path: Path
+) -> int:
+    """把运行时 overlay 里的 api_key_sha256 盖到对应来源上。
+
+    为什么需要 overlay（2026-10-30 真源反转）：
+      部署真源进了 git（chatwoot 仓的 deploy/ 子目录）→ 注册表文件也在 git 里
+      → **真实摘要不能跟着进 git**。于是注册表拆成两份：
+
+        source_systems.yml         在 git · 非敏感配置（id / 显示名 / 标签 / 开关）
+        source_systems.local.yml   在 git 外 · 只有 api_key_sha256
+
+      网关先读主表，再把 overlay 里的摘要盖上去。overlay 不存在时行为不变
+      （主表里若写了摘要，仍照用 —— 兼容旧部署）。
+
+    overlay 里出现主表没有的来源 id → 忽略（不静默新增来源：
+    「哪些来源是合法的」是主表的职责）。
+    """
+    if not path.exists():
+        return 0
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    entries = raw.get("sources") or []
+    if not isinstance(entries, list):
+        raise ConfigError(f"{path} 里的 sources 必须是一个列表")
+
+    applied = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        source_id = str(entry.get("id") or "").strip()
+        digest = str(entry.get("api_key_sha256") or "").strip().lower()
+        if not source_id or not digest:
+            continue
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ConfigError(
+                f"{path} 里来源 {source_id} 的 api_key_sha256 不是合法的 sha256 十六进制"
+            )
+        target = sources.get(source_id)
+        if target is None:
+            continue
+        sources[source_id] = replace(target, api_key_sha256=digest)
+        applied += 1
+    return applied
+
+
 def load_settings() -> Settings:
     """从环境变量 + 注册表装配全局配置。"""
     registry_path = Path(_env("INTAKE_REGISTRY_PATH", "/app/config/source_systems.yml"))
+    local_registry_path = Path(
+        _env("INTAKE_REGISTRY_LOCAL_PATH", "/app/config/source_systems.local.yml")
+    )
 
     base_url = (_env("CHATWOOT_BASE_URL", "http://rails:3000") or "").rstrip("/")
     access_token = _env("CHATWOOT_ACCESS_TOKEN", "") or ""
@@ -201,6 +250,9 @@ def load_settings() -> Settings:
             "缺少 CHATWOOT_ACCESS_TOKEN —— 先跑 scripts/20-bootstrap-chatwoot.sh 生成"
         )
 
+    sources = load_registry(registry_path)
+    apply_local_digests(sources, local_registry_path)
+
     return Settings(
         base_url=base_url,
         account_id=_env_int("CHATWOOT_ACCOUNT_ID", 1),
@@ -209,7 +261,7 @@ def load_settings() -> Settings:
         registry_path=registry_path,
         request_timeout=_env_float("INTAKE_HTTP_TIMEOUT", 20.0),
         max_content_length=_env_int("INTAKE_MAX_CONTENT_LENGTH", 20000),
-        sources=load_registry(registry_path),
+        sources=sources,
         casdoor_enabled=bool(_env("CASDOOR_ENABLED", "false").lower() in ("1", "true", "yes")),
         casdoor_base_url=(_env("CASDOOR_BASE_URL", "") or "").rstrip("/"),
         casdoor_org=_env("CASDOOR_ORG", "") or "",

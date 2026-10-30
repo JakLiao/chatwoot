@@ -36,6 +36,8 @@ ENV_PATH = ROOT / ".env"
 EXAMPLE_PATH = ROOT / ".env.example"
 KEYS_DIR = ROOT / "keys"
 REGISTRY_PATH = ROOT / "gateway" / "config" / "source_systems.yml"
+# 摘要覆盖文件（git 外 · 见 upsert_source 的说明）
+LOCAL_REGISTRY_PATH = ROOT / "gateway" / "config" / "source_systems.local.yml"
 
 # 本机共享实例（只读引用其真值，不复制口令）
 VALKEY_ENV = pathlib.Path.home() / "valkey" / ".env"
@@ -232,8 +234,51 @@ def save_registry(data: dict) -> None:
     os.chmod(REGISTRY_PATH, 0o644)
 
 
+def load_local_digests() -> dict:
+    """读摘要覆盖文件（git 外 · 只有 id → api_key_sha256）。"""
+    if not LOCAL_REGISTRY_PATH.exists():
+        return {"sources": []}
+    data = yaml.safe_load(LOCAL_REGISTRY_PATH.read_text(encoding="utf-8")) or {}
+    data.setdefault("sources", [])
+    return data
+
+
+def save_local_digests(data: dict) -> None:
+    LOCAL_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    body = yaml.safe_dump(
+        data, allow_unicode=True, sort_keys=False, default_flow_style=False, width=120
+    )
+    header = (
+        "# ============================================================================\n"
+        "# source_systems.local.yml · 接入 Key 摘要覆盖文件（**不进 git**）\n"
+        "#\n"
+        "# 真源进了 git → 主注册表 source_systems.yml 不能带真实摘要\n"
+        "# → 摘要写在这里，网关启动时叠加到主表上（见 gateway/app/config.py）\n"
+        "# → 由 scripts/gen-env.py 自动维护，不要手改\n"
+        "# ============================================================================\n"
+    )
+    LOCAL_REGISTRY_PATH.write_text(header + "\n" + body, encoding="utf-8")
+    # 摘要是「验证预言机」：有它就能拿候选 Key 对答案 → 按密钥口径收权限
+    os.chmod(LOCAL_REGISTRY_PATH, 0o600)
+
+
 def upsert_source(entry: dict, api_key: str) -> None:
-    """把来源写进注册表，api_key_sha256 始终与 .env / keys/ 里的明文一致。"""
+    """把来源写进注册表。
+
+    摘要分流（2026-10-30 真源反转）：
+      部署真源进了 git（chatwoot 仓的 deploy/ 子目录）→ 主注册表
+      **也在 git 里** → 真实摘要不能跟着进 git，否则一次 `git add .`
+      就把摘要提上去了。于是拆成两份：
+
+        source_systems.yml         在 git   · 非敏感配置（id / 显示名 / 标签 / 开关）
+        source_systems.local.yml   在 git 外 · 只有 api_key_sha256
+
+      网关启动时先读主表，再把覆盖文件里的摘要盖上去（config.apply_local_digests）。
+      运行时行为与「摘要写主表」完全一致。
+    """
+    digest = sha256_hex(api_key)
+
+    # ---- 主注册表（git 内）：摘要留空占位 ----
     data = load_registry()
     sources = data["sources"]
     record = {
@@ -243,7 +288,8 @@ def upsert_source(entry: dict, api_key: str) -> None:
             entry.get("label") or entry.get("display_name") or entry["id"], entry["id"]
         ),
         "enabled": bool(entry.get("enabled", True)),
-        "api_key_sha256": sha256_hex(api_key),
+        # 占位：真实摘要在 source_systems.local.yml（git 外）
+        "api_key_sha256": "",
         "description": entry.get("description", ""),
         "default_feedback_type": entry.get("default_feedback_type", ""),
     }
@@ -256,6 +302,15 @@ def upsert_source(entry: dict, api_key: str) -> None:
     else:
         sources.append(record)
     save_registry(data)
+
+    # ---- 摘要覆盖文件（git 外）：只存 id → 摘要 ----
+    local = load_local_digests()
+    local_sources = [
+        s for s in local["sources"] if not (isinstance(s, dict) and s.get("id") == entry["id"])
+    ]
+    local_sources.append({"id": entry["id"], "api_key_sha256": digest})
+    local["sources"] = local_sources
+    save_local_digests(local)
 
 
 def env_key_name(source_id: str) -> str:

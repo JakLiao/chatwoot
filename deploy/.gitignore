@@ -10,6 +10,9 @@
 # 各来源系统的接入 Key 明文
 keys/
 
+# 接入 Key 的 sha256 摘要（git 外 · 网关启动时叠加到主注册表上）
+gateway/config/source_systems.local.yml
+
 # 附件持久化
 storage/
 
