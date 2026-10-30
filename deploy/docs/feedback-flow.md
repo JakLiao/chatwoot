@@ -44,22 +44,28 @@ sequenceDiagram
     autonumber
     participant U as 显形用户
     participant X as 显形后端<br/>(Next.js /api/feedback)
+    participant Q as 显形 outbox<br/>(trial_feedback_intake_outbox)
+    participant W as drain worker<br/>(每分钟 · systemd timer)
     participant G as 采集网关<br/>(FastAPI :8080)
     participant C as Casdoor<br/>(yujingsi)
-    participant W as Chatwoot<br/>(:3000)
+    participant D as Chatwoot<br/>(:3000)
 
     U->>X: 填反馈（点赞/点踩 + 文字）
     X->>X: verifyToken(cookie)<br/>拿 user_id = Casdoor sub (UUID)
-    X->>G: POST /intake/v1/feedback<br/>X-Intake-Key + {customer.identifier, feedback, metadata, request_id}
+    X->>X: 落库 trial_user_feedback_response<br/>(upsert · 改答案=覆盖)
+    X->>Q: 入队一行（request_id = 内容指纹）
+    X-->>U: 提交成功（不等网关）
+    W->>Q: 抢占 pending 行（FOR UPDATE SKIP LOCKED）
+    W->>G: POST /intake/v1/feedback<br/>X-Intake-Key + {customer.identifier, feedback, metadata, request_id}
     G->>G: ① 校验 Key → 锁定来源<br/>② 校验载荷（拒收邮箱/电话）
     G->>C: ③ 按 identifier 反查用户<br/>(只读，失败不阻断)
     C-->>G: 用户记录（displayName + id）<br/>或 查不到
-    G->>W: ④ 按 identifier upsert 联系人<br/>(无则建；name 用 Casdoor 展示名)
-    G->>W: ⑤ 按 source_id 幂等建会话<br/>(先查后建 + 同键串行锁)
-    G->>W: ⑥ 建/复用标签并挂到会话
-    W-->>G: 会话 + 联系人
-    G-->>X: 201 {conversation_id, contact_id, status}
-    X-->>U: 提交成功
+    G->>D: ④ 按 identifier upsert 联系人<br/>(无则建；name 用 Casdoor 展示名)
+    G->>D: ⑤ 按 source_id 幂等建会话<br/>(先查后建 + 同键串行锁)
+    G->>D: ⑥ 建/复用标签并挂到会话
+    D-->>G: 会话 + 联系人
+    G-->>W: 201 {conversation_id, contact_id, status}
+    W->>Q: 标 sent（失败则退避重排 / 重试用尽标 failed）
 ```
 
 ---
@@ -173,7 +179,7 @@ X-Intake-Key: <该来源系统的 API Key>
 | `contact_id` | `metadata.companion_contact_id` | ⚠️ **这不是联系方式**，是埋点漏斗点名（`nps-survey` 等） |
 | `session_id` | `metadata.session_id` | |
 | `created_at`（本地生成） | `feedback.occurred_at` | 反馈发生时间 |
-| `id`（`fb_<random>`） | ⚠️ **不能直接当 `request_id`** | 每次调用都新生成 → 见 §4.3 落差 ③ |
+| `id`（库行 id / 降级哈希） | ⚠️ **不能直接当 `request_id`** | upsert 改答案时行 id 不变 → 改答案会被幂等吞掉 → 见 §4.3 落差 ③ |
 | — | `feedback.channel` | 固定 `"app"` 或 `"web"` |
 | — | `feedback.feedback_type` | 建议用固定枚举（`complaint`/`suggestion`/…），中文文案走 `metadata` |
 
@@ -190,24 +196,43 @@ NPS 分数（0-10）可另行派生 `neutral`。
 网关的 `feedback.content` 是必填（`min_length=1`），空字符串会 **422**。
 显形侧需兜底，例如 `content = free_text || preset_reason || '[点赞] 用户未填写文字评价'`。
 
-**③ `request_id` 必须是稳定幂等键**
-显形的 `FeedbackEvent.id` 是 `fb_<32位随机>`，**每次调用 `addFeedback` 都不同**，
-拿它当 `request_id` 等于没有幂等 —— 网关的"先查后建"永远命中不了。
-显形侧应当在**写入自己的 store 之前**生成一个稳定 id，并同时存进自己的事件里：
+**③ `request_id` 必须是稳定幂等键 —— 且必须含内容**
 
-```ts
-// 推荐：内容 + 用户 + 时间桶 派生，重试时复用同一个值
-const requestId = `fb_${sha256(`${user_id}|${target_id}|${free_text}|${bucket}`).slice(0, 24)}`;
-```
+> ⚠️ **2026-10-30 修订**：显形原设计用「反馈行 id」当 `request_id`，在 upsert 落库下**是错的**。
+> 显形的落库是 `ON CONFLICT (user_id,kind,scope,target_type,target_id) DO UPDATE`
+> → 一人·一目标·一类**只有一行**，改答案 = 覆盖同一行 → **行 id 不变**。
+> 于是用户先打 3 分再改成 9 分 → 网关按 source_id 幂等命中 →
+> **Chatwoot 里那条会话永远停在 3 分**，而显形库显示 9 分 → 客服看到的是**过期**情绪，
+> 两边对不上账。
+>
+> 正确做法：**内容指纹**。
+> ```ts
+> request_id = `fb-${sha256(
+>   [user_id, kind, scope, target_type, target_id, score, tier, free_text].join('|')
+> ).slice(0, 24)}`
+> ```
+>
+> | 情形 | 键 | 结果 |
+> |---|---|---|
+> | 同一份内容重复提交（重试） | 同键 | 幂等命中，**不重复建会话** |
+> | 改答案（分数/原话变了） | 异键 | **新建会话**（客户改主意本身也是 VOC 信号） |
+> | 不同用户提交相同文案 | 异键 | 两条独立会话（`user_id` 参与指纹） |
+>
+> ⚠️ 指纹**不含时间戳 / 随机数 / 行 id** —— 含了就等于没有幂等。
+> 也不依赖显形是否落库成功 → 降级期同样成立（不需要两套 key 空间）。
+>
+> 实现：显形仓 `modules/feedback/lib/server/intake-outbox.ts` 的 `buildIntakeRequestId`。
 
-> 顺便建议给显形的 `FeedbackEvent` 加一个 `request_id` 字段，
-> 这样以后补发/重放时有据可查。
+**④（已定 · 2026-10-30）未登录用户不能反馈**
 
-**④（待决策）未登录用户能不能反馈？**
 显形 2026-09-29 已取消游客模式，非 `normal-user` 一律 401。
-若此时 `user_id` 为 `null`，`customer.identifier` 必填就填不出来 —— 反馈根本进不来。
-两个选项：**(a)** 只允许登录用户反馈（最省事，推荐先这么做）；
-**(b)** 允许匿名反馈，但需要一个匿名标识（且网关的 Casdoor 反查会查不到，只落库不补名）。
+显形侧已按此实现（`user_id` 由服务端从会话注入 → 未登录直接 401），
+所以 `customer.identifier` 必填这件事在显形侧**天然成立**，不再需要匿名标识。
+
+> **2026-10-30 另一处修订**：显形转 Chatwoot 的链路已从「进程内 fire-and-forget」
+> 改为**显形侧 outbox + drain worker**（每分钟异步投递）。
+> 显形**不再直接调本网关**，只是把「要投什么」记进队列行；
+> 失败按退避重试，重试用尽标死信。详见显形仓 `docs/operations/chatwoot-intake.md`。
 
 ---
 
@@ -360,14 +385,20 @@ request_id  ──▶  source_id = "<来源>:<request_id>"
 
 代码层面要做的事（**在显形仓库改，本仓不用动**）：
 
-1. **拿到 Key**：向管理员要 `company_xianxing` 的 API Key（`keys/company_xianxing.key`）。
+1. **拿到 Key**：向管理员要 `company_xianxing` 的 API Key
+   （`~/projects/chatwoot-fork/deploy/keys/company_xianxing.key`）。
+   > 显形侧**只写路径**（`VOC_INTAKE_KEY_FILE`），运行时读文件 —— 密钥只存一份。
 2. **拿身份**：从 `AuthContext` / `/api/auth/me` 拿 `user_id`（= Casdoor sub）。
    **不要用 `username`。**
-3. **生成稳定 `request_id`**（见 §4.3 ③），并把它存进自己的 `FeedbackEvent`。
+3. **生成内容指纹 `request_id`**（见 §4.3 ③）。
 4. **组装载荷**：按 §4.2 映射表；`content` 做空值兜底（§4.3 ②）；
    `sentiment` 映射成 `positive`/`negative`（§4.3 ①）。
-5. **POST** 到 `http://<内网地址>:8080/intake/v1/feedback`，带上 `X-Intake-Key`。
-6. **失败重试**：带**原样的 `request_id`** 重发。
+5. **入队**（2026-10-30 起）：把载荷与 `request_id` 写进显形侧的 outbox 队列表，
+   由 drain worker 异步 POST 到 `http://<内网地址>:8080/intake/v1/feedback`，
+   带上 `X-Intake-Key`。
+   > 显形**不在用户请求链路里直调本网关** —— 网关挂了不影响用户提交，
+   > 队列会按退避重试，重试用尽标死信。
+6. **失败重试**：带**原样的 `request_id`** 重发（幂等保证重试安全）。
 7. **不要**在载荷里放邮箱/电话 —— 会被 422 拒绝。
 
 ---
@@ -377,10 +408,13 @@ request_id  ──▶  source_id = "<来源>:<request_id>"
 | 项 | 状态 |
 |---|---|
 | 网关 + Chatwoot + Casdoor 反查 | ✅ 已部署并跑通（本机 `127.0.0.1:8080` / `:3000`） |
-| 显形侧调用采集网关 | ⬜ **未接**（显形的 `/api/feedback` 目前还是内存 mock，没转发给网关） |
-| 显形 `FeedbackEvent` 加 `request_id` 字段 | ⬜ 未做 |
-| `sentiment` 词表统一 | ⬜ 未定（§4.3 ①） |
-| 未登录用户反馈策略 | ⬜ 待决策（§4.3 ④） |
+| 显形侧接入采集网关 | ✅ **已接**（2026-10-28 接通 · 2026-10-30 改为 outbox + worker） |
+| 显形 → 网关的投递方式 | ✅ **outbox 队列 + drain worker**（每分钟 · 退避重试 · 死信可见） |
+| `request_id` 用内容指纹 | ✅ 已改（2026-10-30 · 内容变了 → 新会话；同内容 → 幂等命中） |
+| `sentiment` 词表统一 | ✅ 已映射（显形侧 tier → 网关三值） |
+| 未登录用户反馈策略 | ✅ **只允许登录用户**（显形侧已 401） |
+| 部署真源 | ✅ **已反转**（2026-10-30 · 真源 = chatwoot 仓的 `deploy/` 子目录） |
+| 接入 Key 摘要 | ✅ 已从注册表拆到 `source_systems.local.yml`（git 外） |
 | Casdoor 专用应用 | ⬜ 暂复用 `deepprep-trial-test` 的凭据，可随时用 env 切换 |
 
 > 网关只监听回环。上游服务走**内网地址**，不要把端口暴露到公网。

@@ -74,7 +74,7 @@ X-Intake-Key: ci_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `source_system` | ✅ | 来源系统 id，必须在网关注册表里登记，且与 API Key 绑定的来源一致 |
-| `request_id` | 推荐 | 上游请求唯一 ID，**幂等键**。同一个 `request_id` 重复提交只会产生一条会话 |
+| `request_id` | 推荐 | 上游请求唯一 ID，**幂等键**。同一个 `request_id` 重复提交只会产生一条会话。**建议用「内容指纹」**（见下方「幂等规则」） |
 | `customer.identifier` | ✅ | 客户唯一标识。**建议填 Casdoor 里的用户 id（`sub`，UUID）**（`yujingsi` 组织下），网关会用它回查 Casdoor。填用户名也能查，但用户名会变，不适合当身份键。网关会自动加来源前缀再写进 Chatwoot，所以不同系统的同名客户不会互相覆盖 |
 | `customer.name` | | 客户昵称/姓名（**不是**身份凭证，只是展示用）。不传时网关会从 Casdoor 取展示名补上 |
 | `customer.company` / `city` | | 公司/组织、城市 |
@@ -146,6 +146,25 @@ X-Intake-Key: ci_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 没传 `request_id` 时网关会兜底推导：优先用 `occurred_at`，没有就用 5 分钟时间桶 ——
 能挡住网络重试，但挡不住隔很久的重复提交。**正式接入请务必传 `request_id`。**
+
+### 建议：`request_id` 用「内容指纹」
+
+网关只认「同一个 `request_id` = 同一条会话」这条规则，**键里放什么由接入方决定**。
+但键的**语义**会直接影响 Chatwoot 里的会话形态 —— 选错会出现「显形库里是最新答案、
+Chatwoot 里停在第一次」的分叉。
+
+| 键的内容 | 同内容重试 | 改答案 | 风险 |
+|---|---|---|---|
+| 内容指纹（**推荐**） | 幂等命中，不重复建会话 | **新建会话**（改主意也是信号） | 无 |
+| 业务行 id | 幂等命中 | **被幂等吞掉** → 会话停在旧内容 | ⚠️ 两边分叉 |
+| 时间戳 / 随机数 | **重复建会话** | 新建会话 | ⚠️ 重试即重复 |
+
+> 指纹示例：`fb-<sha256(user_id|kind|scope|target_type|target_id|score|tier|content).slice(0,24)>`
+> —— 含用户与内容，**不含时间戳与随机数**。
+
+**为什么「行 id」是坑**：接入方常把反馈落库成 upsert（一人·一目标一行，改答案=覆盖），
+行 id 在改答案时**不变** → 拿它当键 → 网关认为「重复」→ 复用旧会话 → 新答案永远进不去。
+显形侧踩过这个坑，详见 [`feedback-flow.md`](./feedback-flow.md) §4.3 落差 ③。
 
 ## Chatwoot 侧映射
 

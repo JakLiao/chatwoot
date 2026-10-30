@@ -19,6 +19,10 @@ Chatwoot 里按来源、类型、情绪做筛选和跟进。
                                                     (~/casdoor · yujingsi 组织)
 ```
 
+> **2026-10-30 真源反转**：本目录（chatwoot 仓的 `deploy/` 子目录）就是**部署真源**，
+> 直接在 git 里改。运行时的真值（`.env` / `keys/`）也放在本目录内，由 `.gitignore` 排除。
+> 详见 [真源与提交](#真源与提交)。
+
 ## 边界
 
 - **不对公网暴露**：所有发布端口只绑 `127.0.0.1`；不改 cloudflared 隧道、不加 ufw 放行。
@@ -30,36 +34,39 @@ Chatwoot 里按来源、类型、情绪做筛选和跟进。
   网关会用它回查 Casdoor 补全展示名，并把 `casdoor_user_id` 记进联系人属性便于溯源；
   **查不到或 Casdoor 不可用都不会阻断采集**。
 - **密钥不进 git**：真值在 `.env`（600）与 `keys/`（700 目录 / 600 文件）；
-  注册表里只存 API Key 的 sha256 摘要。
+  接入 Key 的 sha256 摘要在 `gateway/config/source_systems.local.yml`（600）。
+  **提交前跑 `scripts/audit-secrets.sh`** —— 改动直接进 git 之后，这道门禁是唯一的兜底。
 
 ## 目录结构
 
 ```
 .
 ├── docker-compose.yml            # 运维真源：rails / sidekiq / intake
-├── .env                          # 真值（600）· 由 scripts/gen-env.py 生成
+├── .env                          # 真值（600）· 由 scripts/gen-env.py 生成 · 不进 git
 ├── .env.example                  # 占位符模板（可进 git）
-├── keys/                         # 各来源系统的接入 Key 明文（700/600）
+├── keys/                         # 各来源系统的接入 Key 明文（700/600）· 不进 git
 ├── gateway/                      # 采集网关
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   ├── app/
 │   │   ├── main.py               # FastAPI 主服务 + 字段映射
 │   │   ├── chatwoot.py           # Chatwoot Application API 客户端
-│   │   ├── config.py             # 环境变量 + 来源系统注册表
+│   │   ├── config.py             # 环境变量 + 来源系统注册表（含摘要 overlay）
 │   │   ├── schemas.py            # 接口契约
 │   │   └── security.py           # API Key 校验
 │   └── config/
-│       └── source_systems.yml    # 来源系统注册表（唯一事实源）
+│       ├── source_systems.yml    # 来源系统注册表（git 内 · 摘要留占位符）
+│       └── source_systems.local.yml  # 接入 Key 摘要（git 外 · 网关启动时叠加）
 ├── scripts/
-│   ├── gen-env.py                # 生成 / 维护 .env、Key、注册表
+│   ├── gen-env.py                # 生成 / 维护 .env、Key、注册表与摘要
 │   ├── 00-bootstrap-db.sh        # 共享 PG 上建角色 + 库 + 扩展
 │   ├── 10-migrate.sh             # 建表 + 跑迁移
 │   ├── 20-bootstrap-chatwoot.sh  # 账户 / 管理员 / 令牌 / 收件箱 / 标签 / 属性
 │   ├── bootstrap_chatwoot.rb     # 上面那个脚本的 Rails 实现
 │   ├── cleanup_test_data.rb      # 清理自检产生的测试数据
 │   ├── 40-reset-admin-password.sh # 重置管理员密码并存档
-│   └── 30-verify.sh              # 端到端自检（10 项，跑完自动清理）
+│   ├── 30-verify.sh              # 端到端自检（10 项，跑完自动清理）
+│   └── audit-secrets.sh          # 提交前密钥审计（改动直接进 git 后的唯一兜底）
 ├── overrides/
 │   └── zz_sidekiq_redis_timeout.rb  # 覆盖 Sidekiq 的 Redis 读超时（见文件头）
 └── docs/
@@ -98,7 +105,7 @@ bash scripts/40-reset-admin-password.sh
 ## 首次部署
 
 ```bash
-cd ~/projects/chatwoot
+cd ~/projects/chatwoot-fork/deploy
 
 # 1. 生成密钥与来源注册表（会建 .env / keys/company_xianxing.key）
 python3 scripts/gen-env.py
@@ -135,30 +142,63 @@ docker compose down                    # 停（保留数据卷）
 ```bash
 python3 scripts/gen-env.py --add-source website --display-name 官网 --type web
 # → 打印接入 Key（只此一次），已写入 keys/website.key 与 .env
-# → 已追加到 gateway/config/source_systems.yml
+# → 已追加到 gateway/config/source_systems.yml（摘要留占位符）
+# → 真实摘要写入 gateway/config/source_systems.local.yml（git 外）
 docker compose restart intake
 ```
 
-注册表里的 `api_key_sha256` 与 `.env` 里的明文始终保持一致 —— 两个都改了会对不上。
+注册表里的来源 id 与标签等是**配置**（在 git 里），而
+`source_systems.local.yml` 里的 `api_key_sha256` 是**真值**（不在 git 里）——
+网关启动时把后者盖到前者上，两边始终一致（`gen-env.py` 一次写两个文件）。
 
 来源系统被停用时把注册表里的 `enabled` 改成 `false` 再重启网关即可，网关会回 403。
 
-## 发布到 GitHub fork
+## 真源与提交
 
-本地 `~/projects/chatwoot` 是**唯一真值源**。`scripts/publish-to-fork.sh` 把它同步进
-fork 的 `deploy/` 子目录，剥离密钥后提交推送：
+**本目录（chatwoot 仓的 `deploy/` 子目录）就是部署真源，直接在 git 里改。**
+
+> 2026-10-30 之前，真源在仓外的 `~/projects/chatwoot`（不在 git），
+> 改完用 `publish-to-fork.sh` **单向发布**进本目录 —— 那条路已经退役。
+> 单向发布意味着「fork 里手改会被下次发布覆盖」「本机改了不进版本控制直到 publish」，
+> 两个方向都会漂。**现在只有这一个真源。**
+
+### 改完之后
 
 ```bash
-bash scripts/publish-to-fork.sh --dry-run                 # 只同步 + 审计，不提交不推送
-bash scripts/publish-to-fork.sh --branch feat/xxx         # 切/建分支后推送
-bash scripts/publish-to-fork.sh --no-push                 # 只提交不推送
+cd ~/projects/chatwoot-fork/deploy
+
+# 1. 密钥审计（必跑 —— 唯一兜底）
+bash scripts/audit-secrets.sh
+
+# 2. 正常提交（git commit / push 由主理人执行）
+git status
 ```
 
-脚本会剥离 `.env`、`keys/`、注册表里的 `api_key_sha256`，并在提交前做**密钥审计**：
-拿本机真值里的每个敏感串到待提交内容里全文搜，命中即中止提交。
+### 真值放哪
 
-fork 仓库：`https://github.com/JakLiao/chatwoot`（部署在 `deploy/` 子目录，上游 Chatwoot
-源码原样保留；镜像仍用官方 `chatwoot/chatwoot:v4.19.1`）。
+| 文件 | 内容 | 进 git？ |
+|---|---|---|
+| `.env` | PG / Valkey / Chatwoot 令牌 / Casdoor 应用凭据 | ❌（`.gitignore`） |
+| `keys/*.key` | 各来源系统接入 Key 明文 | ❌ |
+| `keys/admin-password.txt` | Chatwoot 管理员口令 | ❌ |
+| `gateway/config/source_systems.yml` | 来源系统配置（摘要留占位符） | ✅ |
+| `gateway/config/source_systems.local.yml` | 接入 Key 的 sha256 摘要 | ❌ |
+
+> ⚠️ **为什么摘要也要拆出去**：摘要不是明文，但它是「验证预言机」——
+> 拿到它就能拿候选 Key 对答案。所以它跟 `.env` 同一档：**不进 git**。
+> 网关启动时先读主注册表，再把 overlay 里的摘要盖上去（`config.apply_local_digests`），
+> 运行时行为与「摘要写主表」完全一致。
+
+### 换机器 / 换目录
+
+compose 项目名固定为 `chatwoot`（compose 文件里 `name: chatwoot`），换目录不换项目。
+但 **bind mount 的宿主路径会变** → 换过目录后要重建一次容器：
+
+```bash
+cd <新的真源目录>
+docker compose up -d --build intake
+docker compose up -d rails sidekiq
+```
 
 ## 资源约束
 
