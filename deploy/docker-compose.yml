@@ -1,0 +1,205 @@
+# ============================================================================
+# docker-compose.yml · Chatwoot 客户声音收集系统
+#
+# 定位（2026-10-28 新增）：
+#   本项目是**本机 Chatwoot 的运维真源**，与 ~/postgres-trial（PostgreSQL）、
+#   ~/valkey（Valkey）同款范式 —— 周边第三方组件一律独立 compose 项目托管，
+#   本项目只做接入方，不自带 PG / Redis 实例。
+#
+# 为什么复用共享基础设施：
+#   · 宿主 14Gi 内存只剩 ~2.5Gi 可用、swap 已用满 3.3Gi —— 再起一套 PG + Redis
+#     会直接把整机拖进 OOM。共享实例只读回环，不额外吃内存。
+#   · 备份 / 升级 / 监控只做一处。
+#   · Valkey 用 db1 隔离：db0 已被 trial-web 占用（~/valkey 的 ACL 用户 app）。
+#
+# 拓扑：
+#   上游业务系统 ──HTTP(内网)──▶ intake 网关 :8080 ──Application API──▶ rails :3000
+#                                                                  └──▶ 共享 PG / Valkey
+#   sidekiq ──▶ 共享 PG / Valkey（异步任务）
+#
+# 网络边界：
+#   · 所有发布端口只绑 127.0.0.1 —— 网关与 Chatwoot 都**不对公网暴露**
+#   · 不改 cloudflared 隧道配置，不加 ufw 放行规则
+#   · 上游只能通过内网地址访问网关；网关自己出站到 Chatwoot 走 compose 内网
+#
+# 资源约束（内存紧张）：
+#   · Puma 单进程 5 线程（WEB_CONCURRENCY=0）· Sidekiq 3 并发
+#   · mem_limit 是护栏：某个进程泄漏时被 cgroup 掐掉，而不是把整机拖垮
+#
+# 用法：
+#   python3 scripts/gen-env.py && bash scripts/00-bootstrap-db.sh
+#   docker compose up -d rails sidekiq
+#   bash scripts/10-migrate.sh && bash scripts/20-bootstrap-chatwoot.sh
+#   docker compose up -d intake
+#   docker compose ps && docker compose logs -f intake
+#
+# ⚠️ 凭证在同目录 .env（600，不进 git）—— 不要把口令写进本文件
+# ============================================================================
+
+name: chatwoot
+
+services:
+  # --------------------------------------------------------------------------
+  # rails · Chatwoot 主服务（Web UI + Application API）
+  # --------------------------------------------------------------------------
+  rails:
+    image: chatwoot/chatwoot:v4.19.1
+    container_name: chatwoot-rails
+    restart: unless-stopped
+
+    entrypoint: docker/entrypoints/rails.sh
+    command: ["bundle", "exec", "rails", "s", "-p", "3000", "-b", "0.0.0.0"]
+
+    env_file:
+      - .env
+    environment:
+      RAILS_ENV: production
+      NODE_ENV: production
+      INSTALLATION_ENV: docker
+      TZ: Asia/Shanghai
+
+    ports:
+      # ⚠️ 只绑回环 —— 管理界面不直接对外网暴露
+      - "127.0.0.1:${CHATWOOT_PORT:-3000}:3000"
+
+    volumes:
+      # 附件（截图等）持久化
+      - storage_data:/app/storage
+      # 覆盖 Sidekiq 的 Redis 读超时（Chatwoot 硬编码 1 秒，短于阻塞读等待时间，
+      # 队列空闲时会刷 "Error fetching job" 噪音日志）—— 见 overrides/ 里的说明
+      - ./overrides/zz_sidekiq_redis_timeout.rb:/app/config/initializers/zz_sidekiq_redis_timeout.rb:ro
+
+    networks:
+      chatwoot-net: {}
+      # 共享 PG · external —— 服务名 db 可解析（宿主 5433 → 容器内恒为 5432）
+      postgres-trial-net: {}
+      # 共享 Valkey · external —— 服务名 valkey 可解析
+      valkey-net: {}
+
+    mem_limit: 1800m
+
+    healthcheck:
+      # 镜像里有 wget、没有 curl，也没有 bash —— healthcheck 只能走 sh + wget
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:3000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # 首次启动要跑 bundle install + 迁移，给足时间
+      start_period: 180s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # --------------------------------------------------------------------------
+  # sidekiq · 后台任务（webhook / 邮件 / 会话活动 / 定时任务）
+  # --------------------------------------------------------------------------
+  sidekiq:
+    image: chatwoot/chatwoot:v4.19.1
+    container_name: chatwoot-sidekiq
+    restart: unless-stopped
+
+    entrypoint: docker/entrypoints/rails.sh
+    command: ["bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+
+    env_file:
+      - .env
+    environment:
+      RAILS_ENV: production
+      NODE_ENV: production
+      INSTALLATION_ENV: docker
+      TZ: Asia/Shanghai
+
+    volumes:
+      - storage_data:/app/storage
+      # 同 rails：覆盖 Sidekiq 的 Redis 读超时
+      - ./overrides/zz_sidekiq_redis_timeout.rb:/app/config/initializers/zz_sidekiq_redis_timeout.rb:ro
+
+    networks:
+      chatwoot-net: {}
+      postgres-trial-net: {}
+      valkey-net: {}
+
+    mem_limit: 900m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # --------------------------------------------------------------------------
+  # intake · 客户声音采集网关
+  #
+  # 上游业务系统（公司显形等）只跟这一个接口打交道：
+  #   POST /intake/v1/feedback  {source_system, customer, feedback, metadata}
+  # 网关负责把它翻译成 Chatwoot Application API 的调用，并统一补齐
+  # 来源系统 / 请求 ID / 时间戳 / 原始 metadata —— 上游不需要知道 Chatwoot 的
+  # 联系人 upsert、source_id 幂等、标签与自定义属性是怎么映射的。
+  # --------------------------------------------------------------------------
+  intake:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    image: chatwoot-intake:local
+    container_name: chatwoot-intake
+    restart: unless-stopped
+
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      # 采集网关自己的配置在 app/config.py 读环境变量
+      INTAKE_REGISTRY_PATH: /app/config/source_systems.yml
+
+    ports:
+      # ⚠️ 只绑回环 —— 上游服务走内网地址访问，不经公网
+      - "127.0.0.1:${INTAKE_PORT:-8080}:8080"
+
+    volumes:
+      # 来源系统注册表（只读挂载 · 新增来源改宿主上的文件后重启本服务）
+      - ./gateway/config:/app/config:ro
+
+    networks:
+      chatwoot-net: {}
+      # Casdoor · external —— 用户身份的唯一真值源，走 casdoor.test:9201 查人
+      casdoor-net: {}
+
+    mem_limit: 320m
+
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # 自己的网络：intake 与 rails 之间用服务名 rails 直连
+  chatwoot-net:
+    name: chatwoot-net
+    driver: bridge
+  # 共享 PG（~/postgres-trial）· external —— 必须先存在
+  postgres-trial-net:
+    name: postgres-trial-net
+    external: true
+  # 共享 Valkey（~/valkey）· external —— 必须先存在
+  valkey-net:
+    name: valkey-net
+    external: true
+  # Casdoor（~/casdoor）· external —— 用户身份的唯一真值源
+  casdoor-net:
+    name: casdoor-net
+    external: true
+
+volumes:
+  storage_data:
+    name: chatwoot-storage

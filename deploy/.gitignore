@@ -1,0 +1,29 @@
+# ============================================================================
+# .gitignore · 真值文件一律不进版本库
+# ============================================================================
+
+# 真值：PostgreSQL 口令 / Valkey ACL 口令 / Chatwoot 访问令牌 / 源码系统接入 Key
+.env
+.env.*
+!.env.example
+
+# 各来源系统的接入 Key 明文
+keys/
+
+# 接入 Key 的 sha256 摘要（git 外 · 网关启动时叠加到主注册表上）
+gateway/config/source_systems.local.yml
+
+# 附件持久化
+storage/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+*.swp
